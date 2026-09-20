@@ -67,13 +67,13 @@ need_root() {
 }
 as_root() {
   resolve_su || return 1
-  # Retry briefly: KernelSU's su daemon can hiccup on a cold start (seen
-  # failing an entire switch once, fine a minute later). Capture stderr so
-  # failures are diagnosable instead of silently swallowed.
+  # KernelSU's root shell does NOT always get a useful PATH (seen during the
+  # home-manager switch: `settings: inaccessible or not found`), so pin the
+  # Android system dirs in front of whatever PATH the root shell inherits.
   _err="$STATE_BASE/su.err"
   _i=0
   while :; do
-    if "$SU_BIN" -c "$1" 2>"$_err"; then
+    if "$SU_BIN" -c "PATH=/system/bin:/system/xbin:/vendor/bin:\$PATH; export PATH; $1" 2>"$_err"; then
       return 0
     fi
     _i=$((_i + 1))

@@ -37,10 +37,12 @@ in_window() {
 }
 
 set_dnd() { # $1 = night|off
+  # Absolute /system/bin/cmd + PATH pin: the root shell's PATH is not
+  # guaranteed (fails with `cmd: inaccessible or not found` otherwise).
   if [ "$1" = night ]; then
-    "$SU_BIN" -c "cmd notification set_dnd $DND_MODE" >/dev/null 2>&1
+    "$SU_BIN" -c "PATH=/system/bin:\$PATH; export PATH; cmd notification set_dnd $DND_MODE" >/dev/null 2>&1
   else
-    "$SU_BIN" -c "cmd notification set_dnd off" >/dev/null 2>&1
+    "$SU_BIN" -c "PATH=/system/bin:\$PATH; export PATH; cmd notification set_dnd off" >/dev/null 2>&1
   fi
 }
 

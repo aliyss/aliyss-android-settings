@@ -34,10 +34,12 @@ in_window() {
 }
 
 set_ui_mode() { # $1 = night|off
+  # PATH pin inside the root shell: it is not guaranteed to include
+  # /system/bin (fails with `cmd: inaccessible or not found` otherwise).
   if [ "$1" = night ]; then
-    "$SU_BIN" -c "cmd uimode night yes" >/dev/null 2>&1
+    "$SU_BIN" -c "PATH=/system/bin:\$PATH; export PATH; cmd uimode night yes" >/dev/null 2>&1
   else
-    "$SU_BIN" -c "cmd uimode night no" >/dev/null 2>&1
+    "$SU_BIN" -c "PATH=/system/bin:\$PATH; export PATH; cmd uimode night no" >/dev/null 2>&1
   fi
 }
 

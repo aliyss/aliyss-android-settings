@@ -84,11 +84,19 @@ single_timer() (
 )
 
 # ---- main event loop ---------------------------------------------------------
-# Singleton: an earlier generation's loop may still be alive — runit's restart
-# only kills the run script, ORPHANING the `su getevent | while` pipeline
-# (proven on-device: two live loops interleaved the shared state and
-# double-fired actions). -o kills the OLDEST match, never ourselves.
-pkill -f -o "libexec/android-settings/hooks/key-remap/run" 2>/dev/null || true
+# Singleton, two-sided (both halves proven necessary on-device):
+# 1. runit's restart only kills the run script — it ORPHANS the
+#    `su getevent | while` pipeline. Kill every other instance of this
+#    script (orphaned loops share our cmdline; our reader subshell does not
+#    exist yet, and $$ is excluded).
+for _p in $(pgrep -f "libexec/android-settings/hooks/key-remap/run" 2>/dev/null); do
+  [ "$_p" = "$$" ] || kill "$_p" 2>/dev/null || true
+done
+# 2. the getevent process itself runs as ROOT (su) — it survives its dead
+#    loop and only root can kill it. Ours starts right after, so killing
+#    all of them first is safe.
+su_run 'kill $(pidof getevent) 2>/dev/null' || true
+sleep 1
 
 # Fresh state: a restart must not inherit a stale down_start (proven on-device:
 # leftover state classified every short press as a 2-day 'late long press').

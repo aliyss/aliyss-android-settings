@@ -21,6 +21,10 @@
 #   cmd:wm density 440                     # raw command, run as root
 set -eu
 
+# $PREFIX is a Termux-shell concept: inside the nix chroot (home-manager
+# activation) it is unset, so default to the standard Termux prefix.
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+
 SELF=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
 BIN_DIR=$(dirname "$SELF")
 ROOT=$(dirname "$BIN_DIR")

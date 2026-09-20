@@ -1,0 +1,5 @@
+# night-dark defaults (sourced by the service run script; overridden by the
+# hookConfig env file written by home-manager)
+NIGHT_START=22:00
+NIGHT_END=07:00
+CHECK_INTERVAL=60

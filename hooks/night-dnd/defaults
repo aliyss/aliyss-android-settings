@@ -1,0 +1,6 @@
+# night-dnd defaults (sourced by the service run script; overridden by the
+# hookConfig env file written by home-manager)
+NIGHT_START=23:00
+NIGHT_END=07:00
+DND_MODE=alarms
+CHECK_INTERVAL=60

@@ -1,0 +1,319 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# android-settings — declarative Android settings + hook services for the
+# aliyss phone (repo: aliyss-android-settings, wired via home-manager).
+#
+# The engine lives in this repo (same pattern as aliyss-android-pkgs: the
+# repo owns the engine, home-manager just calls it). It runs natively in a
+# Termux shell and inside the nix chroot (home-manager activation); anything
+# privileged goes through `su` (KernelSU), so the process itself stays in the
+# app's SELinux domain — runit can always supervise the hooks.
+#
+# Usage:
+#   android-settings apply [--dry-run] [MANIFEST...]
+#   android-settings verify [MANIFEST...]
+#   android-settings install-hook NAME [--env-file FILE]
+#   android-settings remove-hook NAME
+#   android-settings list-hooks
+#
+# Manifest format (see props/default.props):
+#   # comment
+#   global.window_animation_scale = 0.75   # namespace.key = value
+#   cmd:wm density 440                     # raw command, run as root
+set -eu
+
+SELF=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+BIN_DIR=$(dirname "$SELF")
+ROOT=$(dirname "$BIN_DIR")
+
+# In-store layout ($out/share/...) vs in-tree layout (hooks/ next to bin/).
+if [ -d "$ROOT/share/android-settings/hooks" ]; then
+  HOOKS_DIR="$ROOT/share/android-settings/hooks"
+  PROPS_DIR="$ROOT/share/android-settings/props"
+else
+  HOOKS_DIR="$ROOT/hooks"
+  PROPS_DIR="$ROOT/props"
+fi
+
+STATE_BASE="$HOME/.local/state/aliyss-android-settings"
+HOOKS_STATE="$STATE_BASE/hooks"
+LOG_BASE="$HOME/.local/state/aliyss-android-settings/logs"
+LIBEXEC_DIR="$HOME/.local/libexec/android-settings"
+SERVICE_BASE="$PREFIX/var/service/android-settings"
+
+log() { printf '[android-settings] %s\n' "$*"; }
+warn() { printf '[android-settings] !! %s\n' "$*" >&2; }
+die() { warn "$*"; exit 1; }
+
+# Root is needed for settings get/put, cmd, pm — everything this engine does.
+need_root() {
+  command -v su >/dev/null 2>&1 || die "no su found (KernelSU/Magisk required)"
+}
+as_root() { su -c "$1" 2>/dev/null; }
+
+# Escape single quotes for the inner shell su -c spawns.
+esc() { printf '%s' "$1" | sed "s/'/'\\\\''/g"; }
+
+# ---------------------------------------------------------------- manifest
+# Parse + process a manifest. process_line() is set by the caller.
+process_manifest() {
+  file=$1
+  [ -f "$file" ] || die "manifest not found: $file"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      '' | '#'*) continue ;;
+    esac
+    # Trim leading whitespace.
+    line=${line#"${line%%[![:space:]]*}"}
+    case "$line" in '' | '#'*) continue ;; esac
+    process_line "$line" || return 1
+  done <"$file"
+}
+
+# --------------------------------------------------------------- apply/verify
+DRY_RUN=0
+
+settings_line() { # $1 = "ns.key", $2 = value, $3 = mode (put|check)
+  ns=${1%%.*}
+  key=${1#*.}
+  case "$ns" in
+    global | system | secure) : ;;
+    *)
+      warn "bad namespace in: $1 = $2 (global|system|secure)"
+      return 1
+      ;;
+  esac
+  case "$key" in
+    '' | *'.'*) warn "bad key in: $1 = $2"; return 1 ;;
+  esac
+
+  if [ "$3" = put ]; then
+    if [ "$DRY_RUN" = 1 ]; then
+      log "would set: $ns.$key = $2"
+      return 0
+    fi
+    if as_root "settings put $ns '$(esc "$key")' '$(esc "$2")'"; then
+      log "set: $ns.$key = $2"
+      return 0
+    fi
+    warn "settings put failed: $ns.$key"
+    return 1
+  fi
+
+  # check (verify mode)
+  cur=$(as_root "settings get $ns '$(esc "$key")'" || true)
+  if [ "$cur" = "$2" ]; then
+    log "ok: $ns.$key = $2"
+  else
+    warn "diff: $ns.$key — current '${cur:-<unset>}' wanted '$2'"
+    return 1
+  fi
+}
+
+cmd_line() { # $1 = raw command, $2 = mode (put|check)
+  if [ "$2" = put ]; then
+    if [ "$DRY_RUN" = 1 ]; then
+      log "would run: $1"
+      return 0
+    fi
+    if as_root "$1"; then
+      log "ran: $1"
+    else
+      warn "cmd failed: $1"
+      return 1
+    fi
+  else
+    log "cmd (not verifiable): $1"
+  fi
+}
+
+do_apply() {
+  rc=0
+  for m in "$@"; do
+    process_line() {
+      case "$1" in
+        cmd:*) cmd_line "${1#cmd:}" put ;;
+        *)
+          nskey=${1%%=*}
+          value=${1#*=}
+          # Trim whitespace around key and value.
+          nskey=${nskey%"${nskey##*[![:space:]]}"}
+          value=${value#"${value%%[![:space:]]*}"}
+          settings_line "$nskey" "$value" put || rc=1
+          ;;
+      esac
+    }
+    process_manifest "$m" || rc=1
+  done
+  return "$rc"
+}
+
+do_verify() {
+  rc=0
+  for m in "$@"; do
+    process_line() {
+      case "$1" in
+        cmd:*) cmd_line "${1#cmd:}" check ;;
+        *)
+          nskey=${1%%=*}
+          value=${1#*=}
+          nskey=${nskey%"${nskey##*[![:space:]]}"}
+          value=${value#"${value%%[![:space:]]*}"}
+          settings_line "$nskey" "$value" check || rc=1
+          ;;
+      esac
+    }
+    process_manifest "$m" || rc=1
+  done
+  return "$rc"
+}
+
+# ------------------------------------------------------------------- hooks
+valid_hook_name() {
+  case "$1" in
+    '' | *[!a-z0-9_-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+hook_service_dir() { printf '%s-%s' "$SERVICE_BASE" "$1"; }
+
+svc_cmd() { # $1 = sv args...
+  SVDIR="$PREFIX/var/service" sv "$@" >/dev/null 2>&1 || true
+}
+
+install_hook() { # $1 = name, $2 = env file ("" = none)
+  name=$1
+  env_file=$2
+  valid_hook_name "$name" || die "invalid hook name: '$name'"
+  [ -d "$HOOKS_DIR/$name" ] || die "no such hook: $name"
+  [ -x "$HOOKS_DIR/$name/run" ] || die "hook '$name' has no executable run script"
+  need_root
+
+  hook_real="$LIBEXEC_DIR/hooks/$name"
+  service="$(hook_service_dir "$name")"
+  mkdir -p "$hook_real"
+
+  # Copy the hook out of the store as REAL files: /nix is invisible to native
+  # Termux processes (and to runsv), same trick as the tailscaled daemon.
+  cp -f "$HOOKS_DIR/$name/run" "$hook_real/run"
+  chmod 755 "$hook_real/run"
+  if [ -f "$HOOKS_DIR/$name/defaults" ]; then
+    cp -f "$HOOKS_DIR/$name/defaults" "$hook_real/defaults"
+  fi
+  if [ -n "$env_file" ]; then
+    [ -f "$env_file" ] || die "env file not found: $env_file"
+    cp -f "$env_file" "$hook_real/env"
+  else
+    rm -f "$hook_real/env"
+  fi
+
+  mkdir -p "$service"
+  cat >"$service/run" <<EOF
+#!/data/data/com.termux/files/usr/bin/sh
+# android-settings hook service: $name
+# Managed by home-manager (aliyss.androidSettings) — do not edit by hand.
+HOOK_DIR="\$HOME/.local/libexec/android-settings/hooks/$name"
+[ -f "\$HOOK_DIR/defaults" ] && . "\$HOOK_DIR/defaults"
+[ -f "\$HOOK_DIR/env" ] && . "\$HOOK_DIR/env"
+LOG_DIR="\$HOME/.local/state/aliyss-android-settings/logs"
+mkdir -p "\$LOG_DIR"
+{
+  echo "=== $name hook spawned by runit at \$(date '+%Y-%m-%d %H:%M:%S') ==="
+  exec "\$HOOK_DIR/run"
+} >> "\$LOG_DIR/$name.log" 2>&1
+EOF
+  chmod 755 "$service/run"
+  # No `down` file => termux-services autostarts the hook at Termux boot.
+  rm -f "$service/down"
+
+  if [ -d "$service/supervise" ]; then
+    svc_cmd restart "android-settings-$name"
+  else
+    # runsvdir notices new dirs within a few seconds; `up` may fail until
+    # then — harmless, the hook autostarts.
+    svc_cmd up "android-settings-$name"
+  fi
+  log "hook installed: $name (service: android-settings-$name)"
+}
+
+remove_hook() { # $1 = name
+  name=$1
+  valid_hook_name "$name" || die "invalid hook name: '$name'"
+  service="$(hook_service_dir "$name")"
+  if [ -d "$service/supervise" ]; then
+    svc_cmd down "android-settings-$name"
+    sleep 1
+  fi
+  # runsv has exited after `sv down` + dir removal; never rm supervise/ of a
+  # LIVE runsv (termux-services wedge, see tailscale.nix).
+  rm -rf "$service"
+  rm -rf "$LIBEXEC_DIR/hooks/$name"
+  log "hook removed: $name"
+}
+
+list_hooks() {
+  for d in "$HOOKS_DIR"/*/; do
+    [ -d "$d" ] || continue
+    name=$(basename "$d")
+    if [ -x "$(hook_service_dir "$name")/run" ]; then
+      st=$(SVDIR="$PREFIX/var/service" sv status "android-settings-$name" 2>/dev/null |
+        cut -d: -f1 || true)
+      [ -n "$st" ] || st=installed
+      printf '%-16s installed (%s)\n' "$name" "$st"
+    else
+      printf '%-16s available\n' "$name"
+    fi
+  done
+}
+
+# -------------------------------------------------------------------- main
+[ "${1:-}" != "" ] || die "usage: android-settings <apply|verify|install-hook|remove-hook|list-hooks>"
+cmd=$1
+shift
+
+case "$cmd" in
+  apply | verify)
+    # No manifests given -> the repo's reference manifest.
+    if [ $# -eq 0 ]; then
+      set -- "$PROPS_DIR/default.props"
+    fi
+    if [ "$cmd" = apply ]; then
+      for a in "$@"; do
+        [ "$a" = --dry-run ] && DRY_RUN=1
+      done
+      [ "$DRY_RUN" = 1 ] && set -- $(printf '%s\n' "$@" | grep -v -- --dry-run || true)
+      need_root
+      do_apply "$@"
+    else
+      need_root
+      do_verify "$@"
+    fi
+    ;;
+  install-hook)
+    [ $# -ge 1 ] || die "install-hook NAME [--env-file FILE]"
+    name=$1
+    shift
+    env_file=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --env-file)
+          [ $# -ge 2 ] || die "--env-file needs an argument"
+          env_file=$2
+          shift 2
+          ;;
+        *) die "unknown option: $1" ;;
+      esac
+    done
+    install_hook "$name" "$env_file"
+    ;;
+  remove-hook)
+    [ $# -eq 1 ] || die "remove-hook NAME"
+    remove_hook "$1"
+    ;;
+  list-hooks)
+    list_hooks
+    ;;
+  *)
+    die "unknown command: $cmd (see header of $(basename "$0"))"
+    ;;
+esac

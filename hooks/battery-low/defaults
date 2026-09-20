@@ -1,0 +1,4 @@
+# battery-low defaults (sourced by the service run script; overridden by the
+# hookConfig env file written by home-manager)
+THRESHOLD=15
+CHECK_INTERVAL=300

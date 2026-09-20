@@ -1,0 +1,81 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# battery-low — termux-notification when the battery crosses the threshold.
+#
+# Hook contract (aliyss-android-settings): the runit service run script
+# sources defaults + env, then executes this file. It loops forever; runsv
+# restarts it if it ever exits. Native Termux only (termux-api), no root.
+#
+# Env (defaults here, override via hookConfig in home-manager):
+#   THRESHOLD       notify at/below this percentage   (default 15)
+#   REARM_AT        re-arm at/above this percentage   (default THRESHOLD+5)
+#   CHECK_INTERVAL  seconds between battery polls     (default 300)
+
+THRESHOLD=${THRESHOLD:-15}
+CHECK_INTERVAL=${CHECK_INTERVAL:-300}
+REARM_AT=${REARM_AT:-$((THRESHOLD + 5))}
+
+STATE_DIR="$HOME/.local/state/aliyss-android-settings"
+STATE_FILE="$STATE_DIR/state/battery-low"
+mkdir -p "$STATE_DIR/state"
+
+log() { printf '[battery-low] %s\n' "$(date +%H:%M:%S) $*"; }
+
+# termux-battery-status emits one JSON line; percentage can be "87" or "87.0".
+battery() {
+  json=$(termux-battery-status 2>/dev/null) || return 1
+  level=$(
+    printf '%s' "$json" |
+      sed -n 's/.*"percentage" *: *\([0-9][0-9.]*\).*/\1/p' |
+      cut -d. -f1
+  )
+  status=$(
+    printf '%s' "$json" |
+      sed -n 's/.*"status" *: *"\([A-Z_]*\)".*/\1/p'
+  )
+  [ -n "$level" ]
+}
+
+if ! command -v termux-battery-status >/dev/null 2>&1; then
+  log "termux-battery-status missing — install the Termux:API app and 'pkg install termux-api'"
+fi
+
+notified=0
+[ -f "$STATE_FILE" ] && notified=$(cat "$STATE_FILE" 2>/dev/null || printf 0)
+: "${notified:=0}"
+
+log "watching battery (notify <= ${THRESHOLD}%, re-arm >= ${REARM_AT}%) every ${CHECK_INTERVAL}s"
+
+while :; do
+  if battery; then
+    # Hysteresis: once fired, stay quiet until charging or REARM_AT.
+    if [ "$notified" -eq 1 ]; then
+      case "$status" in
+        CHARGING | FULL)
+          log "re-armed (status=$status)"
+          notified=0
+          ;;
+        *)
+          if [ "$level" -ge "$REARM_AT" ] 2>/dev/null; then
+            log "re-armed (level=$level >= $REARM_AT)"
+            notified=0
+          fi
+          ;;
+      esac
+    fi
+    if [ "$notified" -eq 0 ] && [ "$level" -le "$THRESHOLD" ] 2>/dev/null; then
+      if command -v termux-notification >/dev/null 2>&1; then
+        termux-notification \
+          --title "Battery low" \
+          --content "Battery at ${level}% (alert at ${THRESHOLD}%)" \
+          --priority high \
+          >/dev/null 2>&1 || log "termux-notification failed"
+      else
+        log "BATTERY LOW: ${level}% (termux-notification missing)"
+      fi
+      log "notified at ${level}%"
+      notified=1
+    fi
+  fi
+  printf '%s' "$notified" >"$STATE_FILE"
+  sleep "$CHECK_INTERVAL"
+done

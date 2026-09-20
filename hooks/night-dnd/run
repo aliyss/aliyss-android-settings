@@ -1,0 +1,65 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# night-dnd — enable Do-Not-Disturb during a daily window, disable after.
+# Needs root (KernelSU su) for `cmd notification set_dnd`. Runs natively in
+# Termux under runit (android-settings hook contract).
+#
+# Env:
+#   NIGHT_START     window start HH:MM (may cross midnight)   (default 23:00)
+#   NIGHT_END       window end HH:MM                          (default 07:00)
+#   DND_MODE        on|none|priority|alarms                   (default alarms)
+#   CHECK_INTERVAL  seconds between checks                    (default 60)
+
+NIGHT_START=${NIGHT_START:-23:00}
+NIGHT_END=${NIGHT_END:-07:00}
+DND_MODE=${DND_MODE:-alarms}
+CHECK_INTERVAL=${CHECK_INTERVAL:-60}
+
+STATE_DIR="$HOME/.local/state/aliyss-android-settings"
+STATE_FILE="$STATE_DIR/state/night-dnd"
+mkdir -p "$STATE_DIR/state"
+
+log() { printf '[night-dnd] %s\n' "$(date +%H:%M:%S) $*"; }
+
+# HH:MM string compare (zero-padded, so lexicographic order works).
+ge() { [ "$1" \> "$2" ] || [ "$1" = "$2" ]; }
+lt() { [ "$1" \< "$2" ]; }
+
+in_window() {
+  now=$(date +%H:%M)
+  if lt "$NIGHT_START" "$NIGHT_END"; then
+    ge "$now" "$NIGHT_START" && lt "$now" "$NIGHT_END"
+  else
+    ge "$now" "$NIGHT_START" || lt "$now" "$NIGHT_END"
+  fi
+}
+
+set_dnd() { # $1 = night|off
+  if [ "$1" = night ]; then
+    su -c "cmd notification set_dnd $DND_MODE" >/dev/null 2>&1
+  else
+    su -c "cmd notification set_dnd off" >/dev/null 2>&1
+  fi
+}
+
+last=""
+[ -f "$STATE_FILE" ] && last=$(cat "$STATE_FILE" 2>/dev/null)
+
+log "DND window ${NIGHT_START}-${NIGHT_END} (mode=${DND_MODE}, check every ${CHECK_INTERVAL}s)"
+
+while :; do
+  if in_window; then
+    want=night
+  else
+    want=off
+  fi
+  if [ "$want" != "$last" ]; then
+    if set_dnd "$want"; then
+      log "DND $want (mode=${DND_MODE})"
+      printf '%s' "$want" >"$STATE_FILE"
+      last=$want
+    else
+      log "cmd notification set_dnd failed (su denied? Android version?)"
+    fi
+  fi
+  sleep "$CHECK_INTERVAL"
+done

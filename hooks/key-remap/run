@@ -59,6 +59,9 @@ fire() { # $1 = action env var name, $2 = gesture label
   eval "cmd=\${$1}"
   [ -n "$cmd" ] || return 0
   log "$2 -> running action"
+  # Async: actions are fast (am/monkey ~100ms) and the reader loop must not
+  # stall (a `wait` here would also block on armed timer jobs). Orphaned
+  # action children are harmless; the loop itself dies with its getevent.
   su_run "$cmd" &
 }
 
@@ -81,8 +84,15 @@ single_timer() (
 )
 
 # ---- main event loop ---------------------------------------------------------
-# Clean leftover state (a restart must not replay a stale 'clicked').
-rm -f "$S.state"
+# Singleton: an earlier generation's loop may still be alive — runit's restart
+# only kills the run script, ORPHANING the `su getevent | while` pipeline
+# (proven on-device: two live loops interleaved the shared state and
+# double-fired actions). -o kills the OLDEST match, never ourselves.
+pkill -f -o "libexec/android-settings/hooks/key-remap/run" 2>/dev/null || true
+
+# Fresh state: a restart must not inherit a stale down_start (proven on-device:
+# leftover state classified every short press as a 2-day 'late long press').
+rm -f "$S.state" "$S.down_start" "$S.first_up" "$S.long_pid" "$S.single_pid"
 set_state idle
 
 log "remap live: scancode 0x$SC_HEX (short/double/long = ${SINGLE_ACTION:+cmd}/${DOUBLE_ACTION:+cmd}/${LONG_ACTION:+cmd})"

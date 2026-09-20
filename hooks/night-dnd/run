@@ -18,6 +18,9 @@ STATE_DIR="$HOME/.local/state/aliyss-android-settings"
 STATE_FILE="$STATE_DIR/state/night-dnd"
 mkdir -p "$STATE_DIR/state"
 
+# su resolution (KernelSU puts it on /system, not in the Termux prefix).
+SU_BIN=$(command -v su 2>/dev/null || printf /system/bin/su)
+
 log() { printf '[night-dnd] %s\n' "$(date +%H:%M:%S) $*"; }
 
 # HH:MM string compare (zero-padded, so lexicographic order works).
@@ -35,9 +38,9 @@ in_window() {
 
 set_dnd() { # $1 = night|off
   if [ "$1" = night ]; then
-    su -c "cmd notification set_dnd $DND_MODE" >/dev/null 2>&1
+    "$SU_BIN" -c "cmd notification set_dnd $DND_MODE" >/dev/null 2>&1
   else
-    su -c "cmd notification set_dnd off" >/dev/null 2>&1
+    "$SU_BIN" -c "cmd notification set_dnd off" >/dev/null 2>&1
   fi
 }
 

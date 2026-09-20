@@ -49,10 +49,26 @@ warn() { printf '[android-settings] !! %s\n' "$*" >&2; }
 die() { warn "$*"; exit 1; }
 
 # Root is needed for settings get/put, cmd, pm — everything this engine does.
-need_root() {
-  command -v su >/dev/null 2>&1 || die "no su found (KernelSU/Magisk required)"
+# su is not in the activation script's PATH (KernelSU puts it on /system, not
+# in the Termux prefix), so resolve it from the standard locations.
+SU_BIN=""
+resolve_su() {
+  [ -n "$SU_BIN" ] && return 0
+  for c in su /system/bin/su /system/xbin/su /sbin/su; do
+    if command -v "$c" >/dev/null 2>&1; then
+      SU_BIN=$(command -v "$c")
+      return 0
+    fi
+  done
+  return 1
 }
-as_root() { su -c "$1" 2>/dev/null; }
+need_root() {
+  resolve_su || die "no su found (KernelSU/Magisk required)"
+}
+as_root() {
+  resolve_su || return 1
+  "$SU_BIN" -c "$1" 2>/dev/null
+}
 
 # Escape single quotes for the inner shell su -c spawns.
 esc() { printf '%s' "$1" | sed "s/'/'\\\\''/g"; }
@@ -181,8 +197,10 @@ valid_hook_name() {
 
 hook_service_dir() { printf '%s-%s' "$SERVICE_BASE" "$1"; }
 
-svc_cmd() { # $1 = sv args...
-  SVDIR="$PREFIX/var/service" sv "$@" >/dev/null 2>&1 || true
+svc_cmd() { # $1... = sv args
+  SV="$PREFIX/bin/sv"
+  command -v sv >/dev/null 2>&1 && SV=$(command -v sv)
+  SVDIR="$PREFIX/var/service" "$SV" "$@" >/dev/null 2>&1 || true
 }
 
 install_hook() { # $1 = name, $2 = env file ("" = none)

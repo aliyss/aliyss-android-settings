@@ -16,6 +16,9 @@ STATE_DIR="$HOME/.local/state/aliyss-android-settings"
 STATE_FILE="$STATE_DIR/state/night-dark"
 mkdir -p "$STATE_DIR/state"
 
+# su resolution (KernelSU puts it on /system, not in the Termux prefix).
+SU_BIN=$(command -v su 2>/dev/null || printf /system/bin/su)
+
 log() { printf '[night-dark] %s\n' "$(date +%H:%M:%S) $*"; }
 
 ge() { [ "$1" \> "$2" ] || [ "$1" = "$2" ]; }
@@ -32,9 +35,9 @@ in_window() {
 
 set_ui_mode() { # $1 = night|off
   if [ "$1" = night ]; then
-    su -c "cmd uimode night yes" >/dev/null 2>&1
+    "$SU_BIN" -c "cmd uimode night yes" >/dev/null 2>&1
   else
-    su -c "cmd uimode night no" >/dev/null 2>&1
+    "$SU_BIN" -c "cmd uimode night no" >/dev/null 2>&1
   fi
 }
 

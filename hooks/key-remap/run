@@ -31,7 +31,7 @@ DOUBLE_SEC=$(awk "BEGIN{print $DOUBLE_PRESS_MS/1000}")
 STATE_DIR="$HOME/.local/state/aliyss-android-settings"
 mkdir -p "$STATE_DIR/state"
 LOG_DIR="$STATE_DIR/logs"
-SC_HEX=$(printf '0x%x' "0x$SCANCODE")
+SC_HEX=$(printf '%04x' "0x$SCANCODE")
 
 log() { printf '[key-remap] %s\n' "$(date +%H:%M:%S) $*"; }
 
@@ -82,16 +82,21 @@ single_timer() (
 printf '%s' "$!" >"$S.single_pid"
 
 # ---- main event loop ---------------------------------------------------------
-log "remap live: scancode $SC_HEX (short/double/long = ${SINGLE_ACTION:+cmd}/${DOUBLE_ACTION:+cmd}/${LONG_ACTION:+cmd})"
+# Clean leftover state (a restart must not replay a stale 'clicked').
+rm -f "$S.state"
 set_state idle
 
-# Root getevent over all input devices; parse only EV_KEY lines for our
-# scancode. -lt gives labelled DOWN/UP. Runs until killed (runit restarts us).
-/system/bin/su -c "PATH=/system/bin:\$PATH; export PATH; exec getevent -lt" |
-while read -r _ts _dev _type _code _value; do
+log "remap live: scancode 0x$SC_HEX (short/double/long = ${SINGLE_ACTION:+cmd}/${DOUBLE_ACTION:+cmd}/${LONG_ACTION:+cmd})"
+
+# Root getevent over all input devices; parse only EV_KEY (type 0001) events
+# for our scancode. Raw mode prints hex: `/dev/input/eventN: 0001 00fa 00000001`
+# (00000001 = DOWN, 00000000 = UP). -l would print key NAMES, not codes.
+# Runs until killed (runit restarts us).
+/system/bin/su -c "PATH=/system/bin:\$PATH; export PATH; exec getevent -t" |
+while read -r _dev _type _code _value; do
   case "$_type $_code $_value" in
-    "EV_KEY $SC_HEX DOWN") : ;;
-    "EV_KEY $SC_HEX UP") : ;;
+    "0001 $SC_HEX 00000001") _value=DOWN ;;
+    "0001 $SC_HEX 00000000") _value=UP ;;
     *) continue ;;
   esac
 

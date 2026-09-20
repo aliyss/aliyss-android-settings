@@ -252,8 +252,12 @@ install_hook() { # $1 = name, $2 = env file ("" = none)
 # android-settings hook service: $name
 # Managed by home-manager (aliyss.androidSettings) — do not edit by hand.
 HOOK_DIR="\$HOME/.local/libexec/android-settings/hooks/$name"
+# set -a: sourced vars must be EXPORTED — the hook is started with `exec`,
+# which starts a fresh process that only inherits exported variables.
+set -a
 [ -f "\$HOOK_DIR/defaults" ] && . "\$HOOK_DIR/defaults"
 [ -f "\$HOOK_DIR/env" ] && . "\$HOOK_DIR/env"
+set +a
 LOG_DIR="\$HOME/.local/state/aliyss-android-settings/logs"
 mkdir -p "\$LOG_DIR"
 {

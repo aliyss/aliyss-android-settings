@@ -20,10 +20,19 @@ Two surfaces:
 ```fish
 android-settings apply                 # apply the reference manifest
 android-settings verify                # diff current vs wanted (read-only)
+android-settings disable-app com.nothing.ntessentialspace   # pm disable-user --user 0
+android-settings enable-app com.nothing.ntessentialspace    # undo
+android-settings list-disabled         # all disabled packages on the device
 android-settings list-hooks            # available + installed hooks
 android-settings install-hook battery-low
 android-settings remove-hook battery-low
 ```
+
+App disabling is the generic, reversible mechanism (`pm disable-user
+--user 0`) — it works for any user app and most system apps on any Android
+version; `pm hide` needs system perms and `pm suspend` is device-policy
+territory. Declaratively: `aliyss.androidSettings.disabledApps` in the
+dotfiles (ids removed from the list are re-enabled on the next switch).
 
 `android-settings` is wrapped into `~/.local/bin` by the dotfiles
 (`ensure-nix-wrappers.sh`), like every other nix-provided tool.

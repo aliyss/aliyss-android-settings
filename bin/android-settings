@@ -11,6 +11,9 @@
 # Usage:
 #   android-settings apply [--dry-run] [MANIFEST...]
 #   android-settings verify [MANIFEST...]
+#   android-settings disable-app PKG...     (pm disable-user --user 0)
+#   android-settings enable-app PKG...      (pm enable)
+#   android-settings list-disabled
 #   android-settings install-hook NAME [--env-file FILE]
 #   android-settings remove-hook NAME
 #   android-settings list-hooks
@@ -287,6 +290,56 @@ remove_hook() { # $1 = name
   log "hook removed: $name"
 }
 
+# ------------------------------------------------------------------- apps
+# Disabling apps the generic way: `pm disable-user --user 0` (reversible
+# with `pm enable`) — the standard root mechanism, works for any user app
+# and most system apps on any Android (verified on Android 15 / Nothing OS).
+# `pm hide` needs system perms, `pm suspend` is device-policy territory.
+valid_pkg_name() {
+  case "$1" in
+    '' | *[!a-zA-Z0-9._]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+pkg_disabled() { # $1 = pkg id
+  as_root "pm list packages -d '$1'" 2>/dev/null | grep -q "package:$1$"
+}
+
+disable_app() { # $1... = pkg ids
+  for pkg in "$@"; do
+    valid_pkg_name "$pkg" || die "invalid package id: '$pkg'"
+    if pkg_disabled "$pkg"; then
+      log "already disabled: $pkg"
+      continue
+    fi
+    if as_root "pm disable-user --user 0 '$pkg'"; then
+      log "disabled: $pkg"
+    else
+      warn "could not disable $pkg"
+      rc=1
+    fi
+  done
+  return "${rc:-0}"
+}
+
+enable_app() { # $1... = pkg ids
+  for pkg in "$@"; do
+    valid_pkg_name "$pkg" || die "invalid package id: '$pkg'"
+    if as_root "pm enable '$pkg'"; then
+      log "enabled: $pkg"
+    else
+      warn "could not enable $pkg"
+      rc=1
+    fi
+  done
+  return "${rc:-0}"
+}
+
+list_disabled() {
+  as_root "pm list packages -d" | sed 's/^package://' || true
+}
+
 list_hooks() {
   for d in "$HOOKS_DIR"/*/; do
     [ -d "$d" ] || continue
@@ -345,6 +398,20 @@ case "$cmd" in
   remove-hook)
     [ $# -eq 1 ] || die "remove-hook NAME"
     remove_hook "$1"
+    ;;
+  disable-app)
+    [ $# -ge 1 ] || die "disable-app PKG..."
+    need_root
+    disable_app "$@"
+    ;;
+  enable-app)
+    [ $# -ge 1 ] || die "enable-app PKG..."
+    need_root
+    enable_app "$@"
+    ;;
+  list-disabled)
+    need_root
+    list_disabled
     ;;
   list-hooks)
     list_hooks

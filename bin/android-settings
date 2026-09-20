@@ -67,7 +67,21 @@ need_root() {
 }
 as_root() {
   resolve_su || return 1
-  "$SU_BIN" -c "$1" 2>/dev/null
+  # Retry briefly: KernelSU's su daemon can hiccup on a cold start (seen
+  # failing an entire switch once, fine a minute later). Capture stderr so
+  # failures are diagnosable instead of silently swallowed.
+  _err="$STATE_BASE/su.err"
+  _i=0
+  while :; do
+    if "$SU_BIN" -c "$1" 2>"$_err"; then
+      return 0
+    fi
+    _i=$((_i + 1))
+    [ "$_i" -ge 3 ] && break
+    sleep 1
+  done
+  warn "su failed ($(head -c 200 "$_err" 2>/dev/null || true))"
+  return 1
 }
 
 # Escape single quotes for the inner shell su -c spawns.

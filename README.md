@@ -82,6 +82,26 @@ A hook is a directory under `hooks/<name>/`:
 See `hooks/battery-low` (termux-api, no root), `hooks/night-dnd` and
 `hooks/night-dark` (`su -c cmd ...`, root) as templates.
 
+### key-remap (replaces the Keymapper app)
+
+Listens on all input devices as root (`getevent -t`) and detects short /
+double / long presses of one scancode (default `00fa` = the Nothing Essential
+Key), firing a root shell command per gesture:
+
+```nix
+aliyss.androidSettings.hookConfig."key-remap" = {
+  SCANCODE = "00fa";
+  SINGLE_ACTION = "am startservice ...";   # interactive actions via RUN_COMMAND
+  DOUBLE_ACTION = "monkey -p <pkg> -c android.intent.category.LAUNCHER 1";
+  LONG_ACTION   = "monkey -p <pkg> -c android.intent.category.LAUNCHER 1";
+};
+```
+
+Gesture semantics mirror Keymapper: short = released < `LONG_PRESS_MS` (500),
+double = second press within `DOUBLE_PRESS_MS` (350) of the first release,
+long = held ≥ `LONG_PRESS_MS` (fires while held). Event timing uses the
+kernel's monotonic timestamps, so it is immune to wall-clock jumps.
+
 ## Trust model
 
 Manifests and hooks run **as root** (`su`) where needed — this repo is part

@@ -1,0 +1,6 @@
+# key-remap defaults (sourced by the service run script; overridden by the
+# hookConfig env file written by home-manager). Actions must be set via
+# hookConfig — nothing is remapped without them.
+SCANCODE=00fa
+LONG_PRESS_MS=500
+DOUBLE_PRESS_MS=350

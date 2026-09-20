@@ -1,0 +1,142 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# key-remap — remap hardware keys (e.g. the Nothing Essential Key) at the
+# evdev layer. Replaces the Keymapper app: listens on ALL input devices via
+# root `getevent -lt`, detects short / double / long presses of one scancode,
+# and dispatches each gesture to an arbitrary shell command run as root.
+#
+# Hook contract (aliyss-android-settings): sourced with env, executed
+# natively in Termux under runit. Loops forever.
+#
+# Env (defaults here; override via hookConfig in home-manager):
+#   SCANCODE        scancode of the key, hex WITHOUT 0x (default 00fa =
+#                   the Essential Key; getevent prints it as 0xfa)
+#   SINGLE_ACTION   shell command run as root on a short press
+#   DOUBLE_ACTION   ... on a double press
+#   LONG_ACTION     ... on a long press
+#   LONG_PRESS_MS   hold duration that counts as long press (default 500)
+#   DOUBLE_PRESS_MS max gap between presses for a double (default 350)
+#
+# Gesture semantics (mirrors Keymapper):
+#   short  : press+release, released before LONG_PRESS_MS
+#   double : second press starts within DOUBLE_PRESS_MS of the first release
+#   long   : held >= LONG_PRESS_MS (fires while still held)
+#   A long press is never followed by a short; a double consumes both clicks.
+
+SCANCODE=${SCANCODE:-00fa}
+LONG_PRESS_MS=${LONG_PRESS_MS:-500}
+DOUBLE_PRESS_MS=${DOUBLE_PRESS_MS:-350}
+LONG_SEC=$(awk "BEGIN{print $LONG_PRESS_MS/1000}")
+DOUBLE_SEC=$(awk "BEGIN{print $DOUBLE_PRESS_MS/1000}")
+
+STATE_DIR="$HOME/.local/state/aliyss-android-settings"
+mkdir -p "$STATE_DIR/state"
+LOG_DIR="$STATE_DIR/logs"
+SC_HEX=$(printf '0x%x' "0x$SCANCODE")
+
+log() { printf '[key-remap] %s\n' "$(date +%H:%M:%S) $*"; }
+
+# su + PATH pin (the root shell does not inherit a useful PATH on this phone).
+su_run() {
+  /system/bin/su -c "PATH=/system/bin:\$PATH; export PATH; $1" >/dev/null 2>&1
+}
+
+now_ms() { printf '%s' "$(( $(date +%s%N) / 1000000 ))"; }
+
+# State files (so the background timers can consult/kill each other).
+S="$STATE_DIR/state/key-remap"
+set_state() { printf '%s' "$1" >"$S.state"; }
+get_state() { cat "$S.state" 2>/dev/null || printf idle; }
+set_ts() { printf '%s' "$1" >"$S.$2"; }
+get_ts() { cat "$S.$2" 2>/dev/null || printf 0; }
+kill_timer() { # $1 = timer name (long|single)
+  pid=$(cat "$S.$1_pid" 2>/dev/null || true)
+  [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+  rm -f "$S.$1_pid"
+}
+
+fire() { # $1 = action env var name, $2 = gesture label
+  eval "cmd=\${$1}"
+  [ -n "$cmd" ] || return 0
+  log "$2 -> running action"
+  su_run "$cmd" &
+}
+
+# ---- background timers -------------------------------------------------------
+# Long-press timer: armed on DOWN; fires only if the key is STILL down.
+long_timer() (
+  sleep "$LONG_SEC"
+  [ "$(get_state)" = down ] || exit 0
+  set_state long
+  fire LONG_ACTION "long press"
+) &
+printf '%s' "$!" >"$S.long_pid"
+
+# Single-click timer: armed on first release; fires only if no second press
+# arrived in time (the DOWN handler kills it and takes the double).
+single_timer() (
+  sleep "$DOUBLE_SEC"
+  [ "$(get_state)" = clicked ] || exit 0
+  set_state idle
+  fire SINGLE_ACTION "short press"
+) &
+printf '%s' "$!" >"$S.single_pid"
+
+# ---- main event loop ---------------------------------------------------------
+log "remap live: scancode $SC_HEX (short/double/long = ${SINGLE_ACTION:+cmd}/${DOUBLE_ACTION:+cmd}/${LONG_ACTION:+cmd})"
+set_state idle
+
+# Root getevent over all input devices; parse only EV_KEY lines for our
+# scancode. -lt gives labelled DOWN/UP. Runs until killed (runit restarts us).
+/system/bin/su -c "PATH=/system/bin:\$PATH; export PATH; exec getevent -lt" |
+while read -r _ts _dev _type _code _value; do
+  case "$_type $_code $_value" in
+    "EV_KEY $SC_HEX DOWN") : ;;
+    "EV_KEY $SC_HEX UP") : ;;
+    *) continue ;;
+  esac
+
+  case "$_value" in
+    DOWN)
+      case "$(get_state)" in
+        clicked)
+          # Second press inside the double window -> DOUBLE, consume both.
+          kill_timer single
+          set_state double
+          fire DOUBLE_ACTION "double press"
+          ;;
+        idle)
+          kill_timer long
+          set_ts "$(now_ms)" down_start
+          set_state down
+          long_timer &
+          printf '%s' "$!" >"$S.long_pid"
+          ;;
+      esac
+      ;;
+    UP)
+      case "$(get_state)" in
+        down)
+          elapsed=$(( $(now_ms) - $(get_ts down_start) ))
+          if [ "$elapsed" -ge "$LONG_PRESS_MS" ]; then
+            # Long timer should have fired; if it raced us, fire now.
+            set_state long
+            fire LONG_ACTION "long press (late)"
+          else
+            set_state clicked
+            set_ts "$(now_ms)" first_up
+            single_timer &
+            printf '%s' "$!" >"$S.single_pid"
+          fi
+          ;;
+        double)
+          # Release of the second press after the double fired.
+          set_state idle
+          ;;
+        long)
+          # Release after a long press fired; nothing to do.
+          set_state idle
+          ;;
+      esac
+      ;;
+  esac
+done

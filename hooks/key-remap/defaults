@@ -2,5 +2,7 @@
 # hookConfig env file written by home-manager). Actions must be set via
 # hookConfig — nothing is remapped without them.
 SCANCODE=00fa
+# gpio-keys node that reports the Essential Key (getevent -pl: scancode 0xfa)
+KEY_DEVICE=/dev/input/event0
 LONG_PRESS_MS=500
 DOUBLE_PRESS_MS=350

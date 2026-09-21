@@ -84,13 +84,15 @@ See `hooks/battery-low` (termux-api, no root), `hooks/night-dnd` and
 
 ### key-remap (replaces the Keymapper app)
 
-Listens on all input devices as root (`getevent -t`) and detects short /
-double / long presses of one scancode (default `00fa` = the Nothing Essential
-Key), firing a root shell command per gesture:
+Listens as root on the **one** input node that carries the key
+(`getevent -t`, default `/dev/input/event0` = the gpio-keys node where the
+Nothing Essential Key appears as scancode `00fa`) and detects short / double /
+long presses, firing a root shell command per gesture:
 
 ```nix
 aliyss.androidSettings.hookConfig."key-remap" = {
   SCANCODE = "00fa";
+  KEY_DEVICE = "/dev/input/event0";            # gpio-keys; getevent -pl lists it
   SINGLE_ACTION = "am startservice ...";   # interactive actions via RUN_COMMAND
   DOUBLE_ACTION = "monkey -p <pkg> -c android.intent.category.LAUNCHER 1";
   LONG_ACTION   = "monkey -p <pkg> -c android.intent.category.LAUNCHER 1";
@@ -99,8 +101,18 @@ aliyss.androidSettings.hookConfig."key-remap" = {
 
 Gesture semantics mirror Keymapper: short = released < `LONG_PRESS_MS` (500),
 double = second press within `DOUBLE_PRESS_MS` (350) of the first release,
-long = held ≥ `LONG_PRESS_MS` (fires while held). Event timing uses the
-kernel's monotonic timestamps, so it is immune to wall-clock jumps.
+long = held ≥ `LONG_PRESS_MS` (fires while held).
+
+Implementation (`hooks/key-remap/run`, bash): a single-threaded state machine.
+Press durations and the double gap come from the kernel's monotonic event
+timestamps (exact, immune to wall-clock jumps); a 50 ms `read -t` timeout
+drives the two real-time decisions (fire long while held, resolve a pending
+single after the double window). No shared state files and no timer subshells,
+so there is nothing to race. Listening to a single device also avoids the
+touchscreen event flood, which previously caused dropped key-up events.
+
+`DEVICE_CMD`/`NO_CLEANUP` can replay a captured `getevent` log offline for
+testing (see the header of `run`).
 
 ## Trust model
 

@@ -1,7 +1,7 @@
-#!/data/data/com.termux/files/usr/bin/sh
+#!/data/data/com.termux/files/usr/bin/bash
 # key-remap — remap hardware keys (e.g. the Nothing Essential Key) at the
-# evdev layer. Replaces the Keymapper app: listens on ALL input devices via
-# root `getevent -lt`, detects short / double / long presses of one scancode,
+# evdev layer. Replaces the Keymapper app: listens on ONE input device via
+# root `getevent -t`, detects short / double / long presses of one scancode,
 # and dispatches each gesture to an arbitrary shell command run as root.
 #
 # Hook contract (aliyss-android-settings): sourced with env, executed
@@ -10,6 +10,10 @@
 # Env (defaults here; override via hookConfig in home-manager):
 #   SCANCODE        scancode of the key, hex WITHOUT 0x (default 00fa =
 #                   the Essential Key; getevent prints it as 0xfa)
+#   KEY_DEVICE      input node to listen on. The Essential Key is reported on
+#                   the gpio-keys node (verified: /dev/input/event0). Listening
+#                   to a single node avoids the touchscreen event flood, which
+#                   is what made the old all-devices reader drop key-ups.
 #   SINGLE_ACTION   shell command run as root on a short press
 #   DOUBLE_ACTION   ... on a double press
 #   LONG_ACTION     ... on a long press
@@ -17,153 +21,165 @@
 #   DOUBLE_PRESS_MS max gap between presses for a double (default 350)
 #
 # Gesture semantics (mirrors Keymapper):
-#   short  : press+release, released before LONG_PRESS_MS
+#   short  : press+release, released before LONG_PRESS_MS, no second press
+#            inside DOUBLE_PRESS_MS
 #   double : second press starts within DOUBLE_PRESS_MS of the first release
 #   long   : held >= LONG_PRESS_MS (fires while still held)
-#   A long press is never followed by a short; a double consumes both clicks.
+#   A double consumes both clicks; a long press is never followed by a short.
+#
+# Implementation note: this is a SINGLE-THREADED state machine. Press
+# durations and the double gap are computed from the kernel's monotonic event
+# timestamps (exact, immune to wall-clock jumps), while a 50 ms `read -t`
+# timeout drives the two real-time decisions (fire long while held / resolve a
+# pending single after the double window). No shared state files and no
+# background timer subshells -> nothing to race.
+#
+# Test/offline: set DEVICE_CMD to supply events instead of starting getevent,
+# e.g. DEVICE_CMD="cat captured.log" and NO_CLEANUP=1.
 
 SCANCODE=${SCANCODE:-00fa}
 LONG_PRESS_MS=${LONG_PRESS_MS:-500}
 DOUBLE_PRESS_MS=${DOUBLE_PRESS_MS:-350}
-LONG_SEC=$(awk "BEGIN{print $LONG_PRESS_MS/1000}")
-DOUBLE_SEC=$(awk "BEGIN{print $DOUBLE_PRESS_MS/1000}")
+KEY_DEVICE=${KEY_DEVICE:-/dev/input/event0}
+TICK=${TICK:-0.05}
 
 STATE_DIR="$HOME/.local/state/aliyss-android-settings"
-mkdir -p "$STATE_DIR/state"
-LOG_DIR="$STATE_DIR/logs"
+mkdir -p "$STATE_DIR/logs"
+
+# Scancode exactly as getevent prints it (4 lowercase hex digits).
 SC_HEX=$(printf '%04x' "0x$SCANCODE")
 
 log() { printf '[key-remap] %s\n' "$(date +%H:%M:%S) $*"; }
+now_ms() { date +%s%3N; }
 
-# su + PATH pin (the root shell does not inherit a useful PATH on this phone).
-su_run() {
-  /system/bin/su -c "PATH=/system/bin:\$PATH; export PATH; $1" >/dev/null 2>&1
-}
+# Milliseconds between two kernel timestamps (float seconds).
+ms_between() { awk "BEGIN{printf \"%d\", (\"$1\" - \"$2\") * 1000}"; }
 
-# now_ms removed: press durations are computed from the kernel's monotonic
-# event timestamps (precise, and immune to wall-clock jumps).
-
-# State files (so the background timers can consult/kill each other).
-S="$STATE_DIR/state/key-remap"
-set_state() { printf '%s' "$1" >"$S.state"; }
-get_state() { cat "$S.state" 2>/dev/null || printf idle; }
-set_ts() { printf '%s' "$1" >"$S.$2"; }
-get_ts() { cat "$S.$2" 2>/dev/null || printf 0; }
-kill_timer() { # $1 = timer name (long|single)
-  pid=$(cat "$S.$1_pid" 2>/dev/null || true)
-  [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-  rm -f "$S.$1_pid"
-}
+# Run a command as root, detached. The root shell gets no useful PATH on this
+# phone (KernelSU), so pin one.
+su_run() { /system/bin/su -c "PATH=/system/bin:\$PATH; export PATH; $1" >/dev/null 2>&1 & }
 
 fire() { # $1 = action env var name, $2 = gesture label
+  local cmd
   eval "cmd=\${$1}"
   [ -n "$cmd" ] || return 0
   log "$2 -> running action"
-  # Async: actions are fast (am/monkey ~100ms) and the reader loop must not
-  # stall (a `wait` here would also block on armed timer jobs). Orphaned
-  # action children are harmless; the loop itself dies with its getevent.
-  su_run "$cmd" &
+  su_run "$cmd"
 }
 
-# ---- background timers -------------------------------------------------------
-# Long-press timer: armed on DOWN; fires only if the key is STILL down.
-long_timer() (
-  sleep "$LONG_SEC"
-  [ "$(get_state)" = down ] || exit 0
-  set_state long
-  fire LONG_ACTION "long press"
-)
+# ---- state machine ----------------------------------------------------------
+state=idle          # idle | down | long | pending
+down_ts=""          # kernel ts of the current press
+down_wall=0         # wall ms when the current press started (for long-while-held)
+pending_ts=""       # kernel ts of the release awaiting a possible double
+pending_wall=0      # wall ms of that release (to resolve the single press)
 
-# Single-click timer: armed on first release; fires only if no second press
-# arrived in time (the DOWN handler kills it and takes the double).
-single_timer() (
-  sleep "$DOUBLE_SEC"
-  [ "$(get_state)" = clicked ] || exit 0
-  set_state idle
-  fire SINGLE_ACTION "short press"
-)
-
-# ---- main event loop ---------------------------------------------------------
-# Singleton, two-sided (both halves proven necessary on-device):
-# 1. runit's restart only kills the run script — it ORPHANS the
-#    `su getevent | while` pipeline. Kill every other instance of this
-#    script (orphaned loops share our cmdline; our reader subshell does not
-#    exist yet, and $$ is excluded).
-for _p in $(pgrep -f "libexec/android-settings/hooks/key-remap/run" 2>/dev/null); do
-  [ "$_p" = "$$" ] || kill "$_p" 2>/dev/null || true
-done
-# 2. the getevent process itself runs as ROOT (su) — it survives its dead
-#    loop and only root can kill it. Ours starts right after, so killing
-#    all of them first is safe.
-su_run 'kill $(pidof getevent) 2>/dev/null' || true
-sleep 1
-
-# Fresh state: a restart must not inherit a stale down_start (proven on-device:
-# leftover state classified every short press as a 2-day 'late long press').
-rm -f "$S.state" "$S.down_start" "$S.first_up" "$S.long_pid" "$S.single_pid"
-set_state idle
-
-log "remap live: scancode 0x$SC_HEX (short/double/long = ${SINGLE_ACTION:+cmd}/${DOUBLE_ACTION:+cmd}/${LONG_ACTION:+cmd})"
-
-# Root getevent over all input devices; parse only EV_KEY (type 0001) events
-# for our scancode. With -t the format is (verified on-device):
-#   `[  200950.596893] /dev/input/event0: 0001 00fa 00000001`
-# i.e. SIX fields: '[', 'SECONDS.NSEC]', 'DEV:', type, code, value (hex).
-# Without -t there is no timestamp; we want the kernel's monotonic ts for
-# exact press durations, so parse -t and strip the ']' from the ts field.
-# (00000001 = DOWN, 00000000 = UP. -l prints key NAMES, not codes.)
-# Runs until killed (runit restarts us).
-/system/bin/su -c "PATH=/system/bin:\$PATH; export PATH; exec getevent -t" |
-while read -r _lb _ts _dev _type _code _value; do
-  _ts=${_ts%]}
-  case "$_type $_code $_value" in
-    "0001 $SC_HEX 00000001") _value=DOWN ;;
-    "0001 $SC_HEX 00000000") _value=UP ;;
-    *) continue ;;
-  esac
-
-  case "$_value" in
-    DOWN)
-      case "$(get_state)" in
-        clicked)
-          # Second press inside the double window -> DOUBLE, consume both.
-          kill_timer single
-          set_state double
-          fire DOUBLE_ACTION "double press"
-          ;;
-        idle)
-          kill_timer long
-          set_ts "$_ts" down_start
-          set_state down
-          long_timer &
-          printf '%s' "$!" >"$S.long_pid"
-          ;;
-      esac
+on_down() {
+  local ts=$1
+  case "$state" in
+    pending)
+      if [ "$(ms_between "$ts" "$pending_ts")" -le "$DOUBLE_PRESS_MS" ]; then
+        state=idle
+        fire DOUBLE_ACTION "double press"
+        return
+      fi
+      # Second press came too late: resolve the single, then start fresh.
+      state=idle
+      fire SINGLE_ACTION "short press"
       ;;
-    UP)
-      case "$(get_state)" in
-        down)
-          # Both timestamps are kernel monotonic seconds (float) -> ms.
-          elapsed=$(awk "BEGIN{printf \"%d\", ($_ts - $(get_ts down_start)) * 1000}")
-          if [ "$elapsed" -ge "$LONG_PRESS_MS" ]; then
-            # Long timer should have fired; if it raced us, fire now.
-            set_state long
-            fire LONG_ACTION "long press (${elapsed}ms, late)"
-          else
-            set_state clicked
-            single_timer &
-            printf '%s' "$!" >"$S.single_pid"
-          fi
-          ;;
-        double)
-          # Release of the second press after the double fired.
-          set_state idle
-          ;;
-        long)
-          # Release after a long press fired; nothing to do.
-          set_state idle
-          ;;
-      esac
+    down|long) return 0 ;;   # duplicate DOWN, or still held after a long press
+  esac
+  down_ts=$ts
+  down_wall=$(now_ms)
+  state=down
+}
+
+on_up() {
+  local ts=$1 held
+  case "$state" in
+    down)
+      held=$(ms_between "$ts" "$down_ts")
+      if [ "$held" -ge "$LONG_PRESS_MS" ]; then
+        state=idle
+        fire LONG_ACTION "long press (${held}ms, late)"
+      else
+        state=pending
+        pending_ts=$ts
+        pending_wall=$(now_ms)
+      fi
+      ;;
+    long) state=idle ;;
+    *)    return 0 ;;   # idle / pending duplicate -> ignore
+  esac
+}
+
+on_tick() {
+  case "$state" in
+    down)
+      if [ $(( $(now_ms) - down_wall )) -ge "$LONG_PRESS_MS" ]; then
+        state=long
+        fire LONG_ACTION "long press"
+      fi
+      ;;
+    pending)
+      if [ $(( $(now_ms) - pending_wall )) -gt "$DOUBLE_PRESS_MS" ]; then
+        state=idle
+        fire SINGLE_ACTION "short press"
+      fi
       ;;
   esac
+}
+
+handle_line() {
+  local line=$1 ts type code value n
+  local -a f
+  # Use the LAST three whitespace fields: `[ ts] dev: type code value` when
+  # getevent reads all devices, `[ ts] type code value` when one device is
+  # given — both parse the same way.
+  read -ra f <<<"$line"
+  n=${#f[@]}
+  [ "$n" -ge 3 ] || return 0
+  type=${f[n-3]}
+  code=${f[n-2]}
+  value=${f[n-1]}
+  [ "$type" = "0001" ] || return 0        # EV_KEY only
+  [ "$code" = "$SC_HEX" ] || return 0     # our scancode only
+  ts=${line#*[}; ts=${ts%%]*}             # kernel monotonic seconds (float)
+  case "$value" in
+    00000001) on_down "$ts" ;;
+    00000000) on_up "$ts" ;;
+  esac
+}
+
+# ---- singleton cleanup ------------------------------------------------------
+# runit's restart only kills the run script; it ORPHANS the `su getevent | while`
+# pipeline. Kill every other instance of this script, then every root getevent
+# (whose owner is gone). Skipped for offline replay.
+if [ -z "$DEVICE_CMD" ] && [ -z "$NO_CLEANUP" ]; then
+  for _p in $(pgrep -f "android-settings/hooks/key-remap/run" 2>/dev/null); do
+    [ "$_p" = "$$" ] || kill "$_p" 2>/dev/null || true
+  done
+  /system/bin/su -c 'kill $(pidof getevent) 2>/dev/null' >/dev/null 2>&1 || true
+  sleep 1
+fi
+
+log "remap live: scancode 0x$SC_HEX on ${KEY_DEVICE} (short/double/long = ${SINGLE_ACTION:+cmd}/${DOUBLE_ACTION:+cmd}/${LONG_ACTION:+cmd})"
+
+# Default event source: root getevent on the one device that carries the key.
+# (With one device specified, getevent omits the device-name column.)
+if [ -n "$DEVICE_CMD" ]; then
+  GE="$DEVICE_CMD"
+else
+  GE="/system/bin/su -c 'PATH=/system/bin:\$PATH; export PATH; exec getevent -t $KEY_DEVICE'"
+fi
+
+eval "$GE" | while :; do
+  IFS= read -r -t "$TICK" _line
+  _rc=$?
+  if [ "$_rc" -gt 128 ]; then      # read timed out -> housekeeping tick
+    on_tick
+    continue
+  fi
+  [ "$_rc" -ne 0 ] && break        # EOF (device gone / replay finished)
+  handle_line "$_line"
 done

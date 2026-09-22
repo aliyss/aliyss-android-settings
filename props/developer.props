@@ -1,0 +1,18 @@
+# developer — Developer options toggles (several are QS developer tiles)
+#
+# The props/ files are the *library*: everything is commented out, uncomment what
+# you want and apply the file by name (see display.props for the workflow).
+
+# global.development_settings_enabled = 1        # Developer options visible
+# global.adb_enabled = 1                         # USB debugging
+# global.show_touches = 0                        # show taps
+# global.pointer_location = 0                    # pointer location overlay
+# global.debug_layout = 0                        # show layout bounds
+# global.debug_view_attributes = 0
+# global.debug_force_rtl = 0                     # force RTL layout direction
+# global.force_resizable_activities = 0
+# global.always_finish_activities = 0
+# system.pointer_speed = 0                       # mouse / trackpad speed (0-7)
+# system.show_ime_with_hard_keyboard = 1         # always show virtual keyboard
+
+# Animation scales live in animation.props (and are active in default.props).

@@ -1,0 +1,16 @@
+# system-ui — status bar icons, navigation mode, notification LED, immersive mode
+#
+# The props/ files are the *library*: everything is commented out, uncomment what
+# you want and apply the file by name (see display.props for the workflow).
+
+# --- Status bar ---
+# system.status_bar_show_battery_percent = 1     # battery % in the status bar
+# system.icon_blacklist = rotate,volume          # hide icons: rotate,volume,alarm_clock,bluetooth,cast,...
+# system.notification_light_pulse = 1            # notification LED (if the device has one)
+
+# --- Navigation mode ---
+# secure.navigation_mode = 2                     # 0/1 = 3/2-button, 2 = gestural (ROM-dependent)
+
+# --- Immersive / full-screen policy ---
+# global.policy_control = immersive.full=*
+# secure.immersive_mode_confirmations = confirmed

@@ -1,0 +1,18 @@
+# battery — battery saver, adaptive battery, battery percentage, keep-awake while charging
+#
+# The props/ files are the *library*: everything is commented out, uncomment what
+# you want and apply the file by name (see display.props for the workflow).
+
+# --- Battery saver (QS "Battery Saver") ---
+# global.low_power = 1                           # saver on/off
+# global.low_power_sticky = 0                    # keep saver on while charging
+# global.low_power_trigger_level = 0             # auto-enable at N% (0 = never)
+
+# --- Adaptive battery ---
+# global.adaptive_battery_management_enabled = 1
+
+# --- Status bar battery percentage (QS-adjacent) ---
+# system.status_bar_show_battery_percent = 1
+
+# --- Stay awake while charging ---
+# global.stay_on_while_plugged_in = 0            # bitmask: 1=AC, 2=USB, 4=Wireless

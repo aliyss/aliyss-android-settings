@@ -1,9 +1,14 @@
 #!/data/data/com.termux/files/usr/bin/sh
-# battery-low — termux-notification when the battery crosses the threshold.
+# battery-low — notify when the battery crosses the threshold.
 #
 # Hook contract (aliyss-android-settings): the runit service run script
 # sources defaults + env, then executes this file. It loops forever; runsv
-# restarts it if it ever exits. Native Termux only (termux-api), no root.
+# restarts it if it ever exits.
+#
+# Platform-native, no Termux:API: the level comes from `dumpsys battery` as root
+# and the notification from `cmd notification post` via the shared lib/notify.sh
+# helper (which posts as the shell uid — see the header of lib/notify.sh). If the
+# helper is missing — hook copied by hand — it degrades to a log line.
 #
 # Env (defaults here, override via hookConfig in home-manager):
 #   THRESHOLD       notify at/below this percentage   (default 15)
@@ -18,26 +23,43 @@ STATE_DIR="$HOME/.local/state/aliyss-android-settings"
 STATE_FILE="$STATE_DIR/state/battery-low"
 mkdir -p "$STATE_DIR/state"
 
+# Shared helper installed by `android-settings install-hook`.
+NOTIFY_LIB="$HOME/.local/libexec/android-settings/lib/notify.sh"
+[ -f "$NOTIFY_LIB" ] && . "$NOTIFY_LIB"
+
+# su resolution (KernelSU ships su in the Termux prefix here; Magisk on /system).
+SU_BIN=$(command -v su 2>/dev/null || printf /system/bin/su)
+
 log() { printf '[battery-low] %s\n' "$(date +%H:%M:%S) $*"; }
 
-# termux-battery-status emits one JSON line; percentage can be "87" or "87.0".
+# dumpsys battery as root. Status is the platform enum:
+#   1 unknown, 2 charging, 3 discharging, 4 not charging, 5 full
 battery() {
-  json=$(termux-battery-status 2>/dev/null) || return 1
+  dump=$("$SU_BIN" -c "PATH=/system/bin:\$PATH; export PATH; dumpsys battery" 2>/dev/null) || return 1
   level=$(
-    printf '%s' "$json" |
-      sed -n 's/.*"percentage" *: *\([0-9][0-9.]*\).*/\1/p' |
-      cut -d. -f1
+    printf '%s\n' "$dump" |
+      sed -n 's/^ *level: *\([0-9][0-9]*\).*/\1/p' | head -n 1
   )
-  status=$(
-    printf '%s' "$json" |
-      sed -n 's/.*"status" *: *"\([A-Z_]*\)".*/\1/p'
+  code=$(
+    printf '%s\n' "$dump" |
+      sed -n 's/^ *status: *\([0-9][0-9]*\).*/\1/p' | head -n 1
   )
+  case "$code" in
+    2 | 5) status=CHARGING ;;
+    3) status=DISCHARGING ;;
+    4) status=NOT_CHARGING ;;
+    *) status=UNKNOWN ;;
+  esac
   [ -n "$level" ]
 }
 
-if ! command -v termux-battery-status >/dev/null 2>&1; then
-  log "termux-battery-status missing — install the Termux:API app and 'pkg install termux-api'"
-fi
+notify() { # $1 = title, $2 = body
+  if command -v android_notify >/dev/null 2>&1; then
+    android_notify "$1" "$2" battery-low && return 0
+  fi
+  log "NOTIFICATION: $1 — $2"
+  return 1
+}
 
 notified=0
 [ -f "$STATE_FILE" ] && notified=$(cat "$STATE_FILE" 2>/dev/null || printf 0)
@@ -50,7 +72,7 @@ while :; do
     # Hysteresis: once fired, stay quiet until charging or REARM_AT.
     if [ "$notified" -eq 1 ]; then
       case "$status" in
-        CHARGING | FULL)
+        CHARGING)
           log "re-armed (status=$status)"
           notified=0
           ;;
@@ -63,18 +85,12 @@ while :; do
       esac
     fi
     if [ "$notified" -eq 0 ] && [ "$level" -le "$THRESHOLD" ] 2>/dev/null; then
-      if command -v termux-notification >/dev/null 2>&1; then
-        termux-notification \
-          --title "Battery low" \
-          --content "Battery at ${level}% (alert at ${THRESHOLD}%)" \
-          --priority high \
-          >/dev/null 2>&1 || log "termux-notification failed"
-      else
-        log "BATTERY LOW: ${level}% (termux-notification missing)"
-      fi
+      notify "Battery low" "Battery at ${level}% (alert at ${THRESHOLD}%)"
       log "notified at ${level}%"
       notified=1
     fi
+  else
+    log "dumpsys battery failed (su denied? no root?)"
   fi
   printf '%s' "$notified" >"$STATE_FILE"
   sleep "$CHECK_INTERVAL"

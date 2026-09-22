@@ -1,0 +1,25 @@
+# sound — Do Not Disturb, ring/vibrate, haptics, touch & charging sounds, Live Caption
+#
+# The props/ files are the *library*: everything is commented out, uncomment what
+# you want and apply the file by name (see display.props for the workflow).
+
+# --- Do Not Disturb (QS "Do Not Disturb") ---
+# cmd:cmd notification set_dnd off               # off | priority | alarms | on (total silence)
+# secure.zen_mode = 0                            # 0 off, 1 priority, 2 total silence, 3 alarms
+
+# --- Vibrate / haptics ---
+# system.haptic_feedback_enabled = 1             # touch / haptic feedback
+# system.vibrate_on = 1                          # vibrate for incoming calls
+# system.vibrate_when_ringing = 1
+
+# --- Touch & charging sounds ---
+# system.sound_effects_enabled = 1               # touch sounds and dial pad tones
+# global.charging_sounds_enabled = 0
+# global.charging_vibration_enabled = 1
+
+# --- Adaptive sound / Live Caption ---
+# global.adaptive_sound_enabled = 0
+# secure.odi_captions_enabled = 0                # Live Caption
+
+# Ringer mode (normal/vibrate/silent) has no settings key the framework honours
+# reliably — set it from the volume panel or a termux-am intent instead.

@@ -9,8 +9,19 @@
 # app's SELinux domain — runit can always supervise the hooks.
 #
 # Usage:
-#   android-settings apply [--dry-run] [MANIFEST...]
-#   android-settings verify [MANIFEST...]
+#   android-settings apply [--dry-run] [NAME|FILE...]
+#   android-settings verify [NAME|FILE...]
+#   android-settings list-props
+#   android-settings sync-hooks [--env-dir DIR] [--dry-run] NAME...
+#       Install/refresh exactly NAME... (each session's env read from
+#       <DIR>/<name>.env when given), remove hooks the previous run declared and
+#       this one does not, and remember the list in
+#       ~/.local/state/aliyss-android-settings/hooks. Installing is what creates
+#       the runit service; an unchanged hook is left alone (no restart).
+#   android-settings notify TITLE [BODY] [TAG]   (root; no Termux:API needed)
+#   android-settings qs-list                (current QS tiles, one per line)
+#   android-settings qs-add TILE...         (merge into the QS panel)
+#   android-settings qs-remove TILE...      (drop from the QS panel)
 #   android-settings disable-app PKG...     (pm disable-user --user 0)
 #   android-settings enable-app PKG...      (pm enable)
 #   android-settings list-disabled
@@ -18,10 +29,16 @@
 #   android-settings remove-hook NAME
 #   android-settings list-hooks
 #
+# A manifest argument is a path (anything with a slash or a .props suffix), a
+# bare name resolved against props/ (<name>.props), or `all` for every manifest
+# in props/ sorted. With no argument, props/default.props is used.
+#
 # Manifest format (see props/default.props):
 #   # comment
 #   global.window_animation_scale = 0.75   # namespace.key = value
 #   cmd:wm density 440                     # raw command, run as root
+#   qs.add = flashlight                    # ensure QS tiles are in the panel
+#   qs.remove = cast                       # ensure QS tiles are not in the panel
 set -eu
 
 # $PREFIX is a Termux-shell concept: inside the nix chroot (home-manager
@@ -36,10 +53,16 @@ ROOT=$(dirname "$BIN_DIR")
 if [ -d "$ROOT/share/android-settings/hooks" ]; then
   HOOKS_DIR="$ROOT/share/android-settings/hooks"
   PROPS_DIR="$ROOT/share/android-settings/props"
+  LIB_DIR="$ROOT/share/android-settings/lib"
 else
   HOOKS_DIR="$ROOT/hooks"
   PROPS_DIR="$ROOT/props"
+  LIB_DIR="$ROOT/lib"
 fi
+
+# Shared helpers (notify.sh). Optional so the engine still works if only the
+# binary was copied out of the store.
+[ -f "$LIB_DIR/notify.sh" ] && . "$LIB_DIR/notify.sh"
 
 STATE_BASE="$HOME/.local/state/aliyss-android-settings"
 HOOKS_STATE="$STATE_BASE/hooks"
@@ -73,6 +96,9 @@ as_root() {
   # KernelSU's root shell does NOT always get a useful PATH (seen during the
   # home-manager switch: `settings: inaccessible or not found`), so pin the
   # Android system dirs in front of whatever PATH the root shell inherits.
+  # The dir must exist or the redirection below fails and every su call looks
+  # like a denial (nothing else creates it on a fresh device).
+  mkdir -p "$STATE_BASE" 2>/dev/null || true
   _err="$STATE_BASE/su.err"
   _i=0
   while :; do
@@ -169,6 +195,7 @@ do_apply() {
     process_line() {
       case "$1" in
         cmd:*) cmd_line "${1#cmd:}" put ;;
+        qs.*) qs_line "$1" put || rc=1 ;;
         *)
           nskey=${1%%=*}
           value=${1#*=}
@@ -190,6 +217,7 @@ do_verify() {
     process_line() {
       case "$1" in
         cmd:*) cmd_line "${1#cmd:}" check ;;
+        qs.*) qs_line "$1" check || rc=1 ;;
         *)
           nskey=${1%%=*}
           value=${1#*=}
@@ -246,6 +274,14 @@ install_hook() { # $1 = name, $2 = env file ("" = none)
     rm -f "$hook_real/env"
   fi
 
+  # Shared helpers live next to the hooks: a runit-spawned hook runs natively
+  # in Termux, where the nix store is invisible, so it cannot use this engine.
+  if [ -f "$LIB_DIR/notify.sh" ]; then
+    mkdir -p "$LIBEXEC_DIR/lib"
+    cp -f "$LIB_DIR/notify.sh" "$LIBEXEC_DIR/lib/notify.sh"
+    chmod 644 "$LIBEXEC_DIR/lib/notify.sh"
+  fi
+
   mkdir -p "$service"
   cat >"$service/run" <<EOF
 #!/data/data/com.termux/files/usr/bin/sh
@@ -292,6 +328,252 @@ remove_hook() { # $1 = name
   rm -rf "$service"
   rm -rf "$LIBEXEC_DIR/hooks/$name"
   log "hook removed: $name"
+}
+
+# Declarative hook management for the nix side (home-manager activation): the
+# caller passes the FULL list of hooks it wants, and this diffs it against what
+# the previous run declared (tracked in $HOOKS_STATE, the file home-manager's
+# activation used before this command existed). Installing is what creates the
+# runit service, so nothing here runs a hook by itself either.
+#
+hook_installed() { # $1 = name
+  [ -f "$LIBEXEC_DIR/hooks/$1/run" ]
+}
+
+hook_env_current() { # $1 = name, $2 = wanted env file ("" = none)
+  _installed="$LIBEXEC_DIR/hooks/$1/env"
+  if [ -n "$2" ]; then
+    [ -f "$_installed" ] && cmp -s "$2" "$_installed"
+  else
+    [ ! -f "$_installed" ]
+  fi
+}
+
+in_list() { # $1 = needle, $2... = haystack
+  _needle=$1
+  shift
+  for _candidate in "$@"; do
+    if [ "$_candidate" = "$_needle" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+sync_hooks() { # [--env-dir DIR] [--dry-run] NAME...
+  env_dir=""
+  desired=""
+  rc=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --env-dir)
+        [ $# -ge 2 ] || die "--env-dir needs an argument"
+        env_dir=$2
+        shift 2
+        ;;
+      --dry-run)
+        DRY_RUN=1
+        shift
+        ;;
+      -*)
+        die "unknown option: $1"
+        ;;
+      *)
+        desired="$desired $1"
+        shift
+        ;;
+    esac
+  done
+
+  # A missing env dir is a caller bug, not "no config": failing loudly beats
+  # silently installing every hook without its hookConfig env file.
+  if [ -n "$env_dir" ] && [ ! -d "$env_dir" ]; then
+    die "env dir not found: $env_dir"
+  fi
+
+  mkdir -p "$STATE_BASE"
+  previous=""
+  [ -f "$HOOKS_STATE" ] && previous=$(cat "$HOOKS_STATE" 2>/dev/null)
+
+  # Install or refresh everything declared.
+  for name in $desired; do
+    if ! valid_hook_name "$name"; then
+      warn "invalid hook name: '$name'"
+      rc=1
+      continue
+    fi
+    if [ ! -x "$HOOKS_DIR/$name/run" ]; then
+      warn "no such hook in this package: $name (skipped)"
+      rc=1
+      continue
+    fi
+
+    env_file=""
+    if [ -n "$env_dir" ] && [ -f "$env_dir/$name.env" ]; then
+      env_file="$env_dir/$name.env"
+    fi
+
+    if hook_installed "$name" && hook_env_current "$name" "$env_file"; then
+      log "unchanged: $name"
+      continue
+    fi
+    if [ "$DRY_RUN" = 1 ]; then
+      log "would install: $name (env: ${env_file:-none})"
+      continue
+    fi
+    install_hook "$name" "$env_file" || rc=1
+  done
+
+  # Drop what the previous declaration had and this one does not.
+  for name in $previous; do
+    in_list "$name" $desired && continue
+    if ! hook_installed "$name"; then
+      continue
+    fi
+    if [ "$DRY_RUN" = 1 ]; then
+      log "would remove: $name"
+      continue
+    fi
+    remove_hook "$name" || rc=1
+  done
+
+  if [ "$DRY_RUN" != 1 ]; then
+    mkdir -p "$STATE_BASE"
+    : >"$HOOKS_STATE"
+    for name in $desired; do
+      printf '%s\n' "$name" >>"$HOOKS_STATE"
+    done
+  fi
+  return "$rc"
+}
+
+# ------------------------------------------------------- quick settings tiles
+# Settings.Secure.sysui_qs_tiles is the whole QS panel as ONE comma-separated
+# list, so "add a tile" is a merge, not an overwrite: read the list, patch it,
+# write it back. Writing the raw key with `secure.sysui_qs_tiles = ...` still
+# works for a full replace; `qs.add` / `qs.remove` in a manifest (or the
+# qs-add / qs-remove commands) only touch the listed tiles, so they are safe to
+# apply repeatedly and verify.
+QS_KEY=sysui_qs_tiles
+
+qs_read() {
+  _v=$(as_root "settings get secure $QS_KEY" 2>/dev/null || true)
+  _v=$(printf '%s' "$_v" | tr -d '[:space:]')
+  # An unset list reads back as the literal string null.
+  case "$_v" in '' | null) _v="" ;; esac
+  printf '%s' "$_v"
+}
+
+qs_has() { # $1 = tile, $2 = csv list
+  case ",$2," in
+    *",$1,"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+qs_without() { # $1 = tile, $2 = csv list -> the list without that tile
+  _w_old=$2
+  _w_out=""
+  _w_ifs=$IFS
+  IFS=,
+  for _w_t in $_w_old; do
+    if [ "$_w_t" != "$1" ]; then
+      _w_out="${_w_out:+$_w_out,}$_w_t"
+    fi
+  done
+  IFS=$_w_ifs
+  printf '%s' "$_w_out"
+}
+
+qs_write() { # $1 = csv list
+  as_root "settings put secure $QS_KEY '$(esc "$1")'"
+}
+
+# SystemUI reads the tile list at startup, so a change needs a restart to show
+# up. Set NO_QS_RELOAD=1 to skip it (headless applies, tests).
+qs_reload() {
+  [ "${NO_QS_RELOAD:-0}" = 1 ] && return 0
+  as_root "killall com.android.systemui" >/dev/null 2>&1 || true
+}
+
+qs_edit() { # $1 = mode (put|check), $2 = add|remove, $3 = csv of tiles
+  _q_mode=$1
+  _q_op=$2
+  # Callers comma-join, which leaves a trailing comma.
+  _q_tiles=${3%,}
+  _q_cur=$(qs_read)
+  _q_out=$_q_cur
+  _q_rc=0
+  _q_ifs=$IFS
+  IFS=,
+  for _q_t in $_q_tiles; do
+    _q_t=$(printf '%s' "$_q_t" | tr -d '[:space:]')
+    if [ -z "$_q_t" ]; then
+      continue
+    fi
+    if qs_has "$_q_t" "$_q_cur"; then
+      if [ "$_q_op" = add ]; then
+        if [ "$_q_mode" = check ]; then log "ok: qs tile present: $_q_t"; fi
+      else
+        _q_out=$(qs_without "$_q_t" "$_q_out")
+        if [ "$_q_mode" = check ]; then
+          warn "diff: qs tile should be absent: $_q_t"
+          _q_rc=1
+        fi
+      fi
+    else
+      if [ "$_q_op" = add ]; then
+        _q_out="${_q_out:+$_q_out,}$_q_t"
+        if [ "$_q_mode" = check ]; then
+          warn "diff: qs tile missing: $_q_t"
+          _q_rc=1
+        fi
+      else
+        if [ "$_q_mode" = check ]; then log "ok: qs tile absent: $_q_t"; fi
+      fi
+    fi
+  done
+  IFS=$_q_ifs
+
+  if [ "$_q_mode" = put ]; then
+    if [ "$_q_out" = "$_q_cur" ]; then
+      log "ok: qs tiles already $_q_op: $_q_tiles"
+    elif [ "$DRY_RUN" = 1 ]; then
+      log "would set: secure.$QS_KEY = $_q_out"
+    elif qs_write "$_q_out"; then
+      log "set: secure.$QS_KEY = $_q_out"
+      qs_reload
+    else
+      warn "settings put failed: secure.$QS_KEY"
+      _q_rc=1
+    fi
+  fi
+  return "$_q_rc"
+}
+
+# One manifest line: "qs.add = tile[,tile]" / "qs.remove = tile[,tile]".
+qs_line() {
+  case "$1" in
+    *=*) : ;;
+    *)
+      warn "bad qs line (want 'qs.add = TILE'): $1"
+      return 1
+      ;;
+  esac
+  _l_key=${1%%=*}
+  _l_val=${1#*=}
+  # Trim trailing whitespace off the key, leading whitespace off the value.
+  _l_key=${_l_key%"${_l_key##*[![:space:]]}"}
+  _l_val=${_l_val#"${_l_val%%[![:space:]]*}"}
+  case "$_l_key" in
+    qs.add | qs.remove) : ;;
+    *)
+      warn "bad qs op (want qs.add / qs.remove): $_l_key"
+      return 1
+      ;;
+  esac
+  [ -n "$_l_val" ] || { warn "no tiles given: $1"; return 1; }
+  qs_edit "$2" "${_l_key#qs.}" "$_l_val"
 }
 
 # ------------------------------------------------------------------- apps
@@ -344,6 +626,16 @@ list_disabled() {
   as_root "pm list packages -d" | sed 's/^package://' || true
 }
 
+list_props() {
+  for f in "$PROPS_DIR"/*.props; do
+    [ -f "$f" ] || continue
+    name=$(basename "$f" .props)
+    # The first line of every manifest is its one-line summary.
+    desc=$(sed -n '1p' "$f" | sed 's/^# *//')
+    printf '%-16s %s\n' "$name" "$desc"
+  done
+}
+
 list_hooks() {
   for d in "$HOOKS_DIR"/*/; do
     [ -d "$d" ] || continue
@@ -360,25 +652,46 @@ list_hooks() {
 }
 
 # -------------------------------------------------------------------- main
-[ "${1:-}" != "" ] || die "usage: android-settings <apply|verify|install-hook|remove-hook|list-hooks>"
+[ "${1:-}" != "" ] || die "usage: android-settings <apply|verify|list-props|notify|sync-hooks|qs-list|qs-add|qs-remove|install-hook|remove-hook|list-hooks>"
 cmd=$1
 shift
 
+# Resolve one manifest argument into a path (see the usage note above).
+resolve_manifest() {
+  case "$1" in
+    all)
+      for f in "$PROPS_DIR"/*.props; do
+        [ -f "$f" ] || continue
+        printf '%s\n' "$f"
+      done
+      ;;
+    */* | *.props) printf '%s\n' "$1" ;;
+    *) printf '%s\n' "$PROPS_DIR/$1.props" ;;
+  esac
+}
+
 case "$cmd" in
   apply | verify)
-    # No manifests given -> the repo's reference manifest.
-    if [ $# -eq 0 ]; then
-      set -- "$PROPS_DIR/default.props"
-    fi
+    DRY_RUN=0
+    manifests=""
+    # Resolved paths are space-joined below (nix store paths never contain
+    # spaces), which is what plain sh gives us for `set --`.
+    for a in "$@"; do
+      case "$a" in
+        --dry-run) DRY_RUN=1 ;;
+        *) manifests="$manifests $(resolve_manifest "$a")" ;;
+      esac
+    done
+    # Only flags (or nothing) given -> the repo's applied manifest.
+    [ -n "$manifests" ] || manifests="$(resolve_manifest default)"
+    [ -n "$manifests" ] || die "no manifests to $cmd"
+    # Intentional word-splitting of the manifest list.
+    # shellcheck disable=SC2086
+    set -- $manifests
+    need_root
     if [ "$cmd" = apply ]; then
-      for a in "$@"; do
-        [ "$a" = --dry-run ] && DRY_RUN=1
-      done
-      [ "$DRY_RUN" = 1 ] && set -- $(printf '%s\n' "$@" | grep -v -- --dry-run || true)
-      need_root
       do_apply "$@"
     else
-      need_root
       do_verify "$@"
     fi
     ;;
@@ -419,6 +732,50 @@ case "$cmd" in
     ;;
   list-hooks)
     list_hooks
+    ;;
+  list-props)
+    list_props
+    ;;
+  sync-hooks)
+    sync_hooks "$@"
+    ;;
+  notify)
+    [ $# -ge 1 ] || die "notify TITLE [BODY] [TAG]"
+    n_title=$1
+    shift
+    n_body=""
+    n_tag=android-settings
+    if [ $# -ge 1 ]; then
+      n_body=$1
+      shift
+    fi
+    if [ $# -ge 1 ]; then
+      n_tag=$1
+      shift
+    fi
+    need_root
+    command -v android_notify >/dev/null 2>&1 || die "notify helper missing: $LIB_DIR/notify.sh"
+    android_notify "$n_title" "$n_body" "$n_tag" || die "could not post notification"
+    log "notified: $n_title"
+    ;;
+  qs-list)
+    need_root
+    _tiles=$(qs_read)
+    if [ -n "$_tiles" ]; then
+      printf '%s\n' "$_tiles" | tr ',' '\n'
+    else
+      log "no qs tiles set ($QS_KEY is empty)"
+    fi
+    ;;
+  qs-add)
+    [ $# -ge 1 ] || die "qs-add TILE..."
+    need_root
+    qs_edit put add "$(printf '%s,' "$@")"
+    ;;
+  qs-remove)
+    [ $# -ge 1 ] || die "qs-remove TILE..."
+    need_root
+    qs_edit put remove "$(printf '%s,' "$@")"
     ;;
   *)
     die "unknown command: $cmd (see header of $(basename "$0"))"

@@ -1,0 +1,48 @@
+# display — brightness, timeout, dark theme, night light, extra dim, color correction
+#
+# Every line here is commented out: the props/ files are the *library*. Uncomment
+# what you want, then apply just that file (or copy lines into default.props):
+#
+#   android-settings list-props          # list the library
+#   android-settings apply display       # this file
+#   android-settings verify display      # dry-check it (read-only)
+#   android-settings apply all           # every manifest, sorted
+#
+# Values are the ones the Settings UI writes, so they round-trip with
+# `settings get` — verify will tell you if they drift.
+
+# --- Brightness / timeout ---
+# system.screen_brightness = 128                 # 0-255, manual brightness
+# system.screen_brightness_mode = 1              # 0 manual, 1 adaptive brightness
+# system.screen_off_timeout = 30000              # ms (30s), display sleep
+# secure.screen_off_timeout = 30000              # mirror some ROMs read instead
+# system.peak_refresh_rate = 120.0               # max refresh rate (Hz)
+# system.min_refresh_rate = 60.0                 # min refresh rate (Hz)
+
+# --- Dark theme (QS "Dark theme") ---
+# cmd:cmd uimode night yes
+# cmd:cmd uimode night no
+# secure.ui_night_mode = 2                       # 1 light, 2 dark (mirror of cmd uimode)
+
+# --- Night light (QS "Night light") ---
+# secure.night_display_enabled = 1
+# secure.night_display_activated = 1
+# secure.night_display_auto_mode = 2             # 0 off, 1 custom times, 2 sunset->sunrise
+# secure.night_display_color_temperature = 4082  # Kelvin; lower = warmer
+# secure.night_display_custom_start_time = 1320  # minutes after midnight (22:00)
+# secure.night_display_custom_end_time = 420     # minutes after midnight (07:00)
+
+# --- Extra dim (QS "Extra dim") ---
+# secure.reduce_bright_colors_activated = 1
+# secure.reduce_bright_colors_percent = 50       # strength 0-100
+# secure.reduce_bright_colors_auto_activated = 0
+
+# --- Color correction / inversion (accessibility) ---
+# secure.accessibility_display_daltonizer_enabled = 1
+# secure.accessibility_display_daltonizer = 12    # 0 mono, 11 protan, 12 deuteran, 13 tritan
+# secure.accessibility_display_inversion_enabled = 0
+
+# --- Screensaver (daydream) ---
+# secure.screensaver_enabled = 0
+# secure.screensaver_activate_on_dock = 1
+# secure.screensaver_activate_on_sleep = 0

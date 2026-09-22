@@ -1,0 +1,173 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# brightness — watch the screen brightness and dispatch it as events.
+#
+# An event SOURCE for the dotfiles, in the spirit of key-remap: it polls the
+# system brightness settings and runs a configured root command per event. The
+# interesting case is the mode flip — ROMs (Nothing OS included) drop
+# auto-brightness to manual as soon as you drag the slider, so the dotfiles can
+# simply turn it back on; level events cover things like warning at 100%.
+#
+# Hook contract (aliyss-android-settings): sourced with env, executed natively in
+# Termux under runit, loops forever. Nothing runs until the dotfiles declare the
+# hook — home-manager calls `install-hook`, which is what creates the service.
+#
+# Env (defaults here; override via hookConfig in home-manager):
+#   CHECK_INTERVAL  seconds between polls                             (default 30)
+#   STEP            level change (0-255) that counts as an event      (default 15)
+#   MIN_INTERVAL    minimum seconds between level events              (default 60)
+#   LEVEL_IN_AUTO   1 = also emit level events while auto-brightness  (default 0:
+#                   auto ramps with ambient light, which would be spam)
+#   MODE_ACTION     shell command run as root when auto<->manual flips
+#   LEVEL_ACTION    shell command run as root when the level moves >= STEP
+#   NOTIFY          1 = also post a built-in notification per event   (default 0)
+#
+# Action environment (exported for MODE_ACTION / LEVEL_ACTION):
+#   EVENT=mode|level
+#   MODE=auto|manual            PREV_MODE
+#   BRIGHTNESS (0-255)          PREV_BRIGHTNESS
+#   PERCENT (0-100)             PREV_PERCENT
+#
+# Actions run detached as root, like key-remap's gestures, so a slow command
+# cannot stall the poll loop.
+
+CHECK_INTERVAL=${CHECK_INTERVAL:-30}
+STEP=${STEP:-15}
+MIN_INTERVAL=${MIN_INTERVAL:-60}
+LEVEL_IN_AUTO=${LEVEL_IN_AUTO:-0}
+MODE_ACTION=${MODE_ACTION:-}
+LEVEL_ACTION=${LEVEL_ACTION:-}
+NOTIFY=${NOTIFY:-0}
+
+STATE_DIR="$HOME/.local/state/aliyss-android-settings"
+STATE_FILE="$STATE_DIR/state/brightness"
+mkdir -p "$STATE_DIR/state"
+
+# Shared helper installed by `android-settings install-hook`.
+NOTIFY_LIB="$HOME/.local/libexec/android-settings/lib/notify.sh"
+[ -f "$NOTIFY_LIB" ] && . "$NOTIFY_LIB"
+
+# su resolution (KernelSU ships su in the Termux prefix here; Magisk on /system).
+SU_BIN=$(command -v su 2>/dev/null || printf /system/bin/su)
+
+log() { printf '[brightness] %s\n' "$(date +%H:%M:%S) $*"; }
+
+esc() { printf '%s' "$1" | sed "s/'/'\\\\''/g"; }
+
+as_root_out() { # $1 = command; prints its stdout
+  "$SU_BIN" -c "PATH=/system/bin:/system/xbin:\$PATH; export PATH; $1" 2>/dev/null
+}
+
+# Both settings in ONE root shell: spawning `su` is the expensive part of a
+# poll loop, and this runs every CHECK_INTERVAL. Sets cur_level / cur_mode
+# (either may be empty when the setting is unset). Values are handed back as
+# globals rather than as a joined string on purpose: `|` inside a ${x%%|*}
+# pattern is alternation under mksh, so the split silently returns nothing
+# there even though Termux's sh (dash) is fine with it.
+read_state() {
+  _out=$(as_root_out "settings get system screen_brightness; settings get system screen_brightness_mode")
+  cur_level=$(printf '%s\n' "$_out" | sed -n 1p | tr -d '[:space:]')
+  cur_mode=$(printf '%s\n' "$_out" | sed -n 2p | tr -d '[:space:]')
+  case "$cur_level" in null) cur_level='' ;; esac
+  case "$cur_mode" in null) cur_mode='' ;; esac
+}
+
+# Observed values are handed to the action through the root shell's environment
+# (a plain export would not survive `su`, which may reset the environment).
+EV_ENV=''
+ev_set() { # $1 = name, $2 = value
+  EV_ENV="$EV_ENV$1='$(esc "$2")'; export $1; "
+}
+
+run_action() { # $1 = command (runs with $EV_ENV in scope)
+  [ -n "$1" ] || return 0
+  log "action: $1"
+  "$SU_BIN" -c "PATH=/system/bin:/system/xbin:\$PATH; export PATH; $EV_ENV$1" >/dev/null 2>&1 &
+}
+
+notify() { # $1 = title, $2 = body
+  if command -v android_notify >/dev/null 2>&1; then
+    android_notify "$1" "$2" brightness && return 0
+  fi
+  log "NOTIFICATION: $1 — $2"
+  return 1
+}
+
+percent() { # $1 = 0-255 level
+  case "$1" in '' | *[!0-9]*) printf '' ;; *) printf '%s' "$(( $1 * 100 / 255 ))" ;; esac
+}
+
+emit() { # $1 = event, $2 = level, $3 = prev level, $4 = mode, $5 = prev mode
+  EV_ENV=''
+  ev_set EVENT "$1"
+  ev_set MODE "$4"
+  ev_set PREV_MODE "$5"
+  ev_set BRIGHTNESS "$2"
+  ev_set PREV_BRIGHTNESS "$3"
+  ev_set PERCENT "$(percent "$2")"
+  ev_set PREV_PERCENT "$(percent "$3")"
+
+  case "$1" in
+    mode)
+      log "mode: ${5:-?} -> $4 (brightness ${2:-?}, $(percent "$2")%)"
+      run_action "$MODE_ACTION"
+      [ "$NOTIFY" = 1 ] && notify "Brightness mode" "$4 (was ${5:-?}), $(percent "$2")%"
+      ;;
+    level)
+      log "level: ${3:-?} -> $2 ($(percent "$2")%, $4)"
+      run_action "$LEVEL_ACTION"
+      [ "$NOTIFY" = 1 ] && notify "Brightness" "$(percent "$2")% ($4)"
+      ;;
+  esac
+  return 0
+}
+
+# "<mode> <level>", split by `read` (no separator inside a pattern).
+prev_mode=''
+prev_level=''
+[ -f "$STATE_FILE" ] && read -r prev_mode prev_level <"$STATE_FILE"
+
+log "watching brightness (every ${CHECK_INTERVAL}s, step ${STEP}, level events in auto: ${LEVEL_IN_AUTO})"
+
+last_level_event=0
+
+while :; do
+  read_state
+  level=$cur_level
+  rawmode=$cur_mode
+  case "$rawmode" in
+    1) mode=auto ;;
+    *) mode=manual ;;
+  esac
+  now=$(date +%s)
+
+  if [ -z "$prev_mode" ] && [ -z "$prev_level" ]; then
+    # First ever run: adopt what is on screen instead of firing on boot.
+    prev_mode=$mode
+    prev_level=$level
+    printf '%s %s' "$prev_mode" "$prev_level" >"$STATE_FILE"
+    log "starting from mode=$prev_mode brightness=${prev_level:-?}"
+  elif [ "$mode" != "$prev_mode" ]; then
+    emit mode "$level" "$prev_level" "$mode" "$prev_mode"
+    prev_mode=$mode
+    prev_level=$level
+    last_level_event=$now
+    printf '%s %s' "$prev_mode" "$prev_level" >"$STATE_FILE"
+  elif [ -n "$level" ] && [ -n "$prev_level" ]; then
+    _diff=$(( level - prev_level ))
+    [ "$_diff" -lt 0 ] && _diff=$(( -_diff ))
+    if [ "$_diff" -ge "$STEP" ]; then
+      if [ "$mode" = auto ] && [ "$LEVEL_IN_AUTO" != 1 ]; then
+        # Track it silently so the next manual change is measured from here.
+        prev_level=$level
+        printf '%s %s' "$prev_mode" "$prev_level" >"$STATE_FILE"
+      elif [ $(( now - last_level_event )) -ge "$MIN_INTERVAL" ]; then
+        emit level "$level" "$prev_level" "$mode" "$prev_mode"
+        prev_level=$level
+        last_level_event=$now
+        printf '%s %s' "$prev_mode" "$prev_level" >"$STATE_FILE"
+      fi
+    fi
+  fi
+
+  sleep "$CHECK_INTERVAL"
+done

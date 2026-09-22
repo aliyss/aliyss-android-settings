@@ -1,0 +1,152 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# net-watch — notify when the active network changes (Wi-Fi / mobile / VPN /
+# ethernet / offline), once the new state has been stable for MIN_STABLE seconds.
+#
+# Hook contract (aliyss-android-settings): the runit service run script sources
+# defaults + env, then executes this file. It loops forever; runsv restarts it if
+# it ever exits.
+#
+# Platform-native, no Termux:API. Android routes per network, so /proc/net/route
+# only holds the on-link peer routes and has no default entry — instead ask the
+# kernel which interface a packet to PROBE_TARGET would actually leave through
+# (`ip route get`), which also covers VPNs. `cmd wifi status` supplies the SSID,
+# and the alert goes through the shared lib/notify.sh helper.
+#
+# Env (defaults here, override via hookConfig in home-manager):
+#   CHECK_INTERVAL  seconds between checks                         (default 60)
+#   MIN_STABLE      seconds a new state must hold before notifying  (default 30)
+#   PROBE_TARGET    address used for the route lookup               (default 1.1.1.1)
+
+CHECK_INTERVAL=${CHECK_INTERVAL:-60}
+MIN_STABLE=${MIN_STABLE:-30}
+PROBE_TARGET=${PROBE_TARGET:-1.1.1.1}
+
+STATE_DIR="$HOME/.local/state/aliyss-android-settings"
+STATE_FILE="$STATE_DIR/state/net-watch"
+mkdir -p "$STATE_DIR/state"
+
+# Shared helper installed by `android-settings install-hook`.
+NOTIFY_LIB="$HOME/.local/libexec/android-settings/lib/notify.sh"
+[ -f "$NOTIFY_LIB" ] && . "$NOTIFY_LIB"
+
+# su resolution (KernelSU ships su in the Termux prefix here; Magisk on /system).
+SU_BIN=$(command -v su 2>/dev/null || printf /system/bin/su)
+
+log() { printf '[net-watch] %s\n' "$(date +%H:%M:%S) $*"; }
+
+as_root_out() { # $1 = command; prints its stdout
+  "$SU_BIN" -c "PATH=/system/bin:/system/xbin:\$PATH; export PATH; $1" 2>/dev/null
+}
+
+# Interface a packet to PROBE_TARGET would use, e.g.
+#   1.1.1.1 via 10.128.119.213 dev rmnet_data4 table 1027 src 10.128.119.214 uid 0
+# Empty output = no route (offline) or root denied.
+egress_iface() {
+  as_root_out "ip route get $PROBE_TARGET" |
+    sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1
+}
+
+kind_of() { # $1 = interface name -> state key
+  case "$1" in
+    '') printf 'offline' ;;
+    wlan*) printf 'wifi' ;;
+    rmnet* | ccmni* | pdp* | wwan* | seth*) printf 'mobile' ;;
+    eth* | rndis* | usb*) printf 'ethernet' ;;
+    tun* | ppp* | ipsec*) printf 'vpn' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# SSID of the current Wi-Fi connection, if any, from the mWifiInfo dump:
+#   mWifiInfo SSID: "Bengel-der-Engelgasse", BSSID: ec:6c:9a:.., MAC: ..
+# Two traps: a greedy `.*` in sed would match the BSSID copy of the label (and
+# is why we take the leftmost grep -o match instead), and `\?` is not portable
+# (no toybox/BSD support), hence the BRE interval `\{0,1\}`. Anything that is not
+# a real name — <unknown ssid>, a hex 0x… form — is dropped, not reported.
+wifi_ssid() {
+  _w_raw=$(as_root_out "dumpsys wifi" | grep -m1 'mWifiInfo')
+  [ -n "$_w_raw" ] || return 0
+  _w_ssid=$(printf '%s\n' "$_w_raw" |
+    grep -o -e '[^A-Za-z]SSID: *"\{0,1\}[^",]*' -e '^SSID: *"\{0,1\}[^",]*' |
+    head -n 1 |
+    sed -e 's/^[^A-Za-z]SSID: *"\{0,1\}//' -e 's/^SSID: *"\{0,1\}//')
+  case "$_w_ssid" in
+    '' | '<unknown ssid>' | 'unknown ssid' | 0x*) : ;;
+    *) printf '%s' "$_w_ssid" ;;
+  esac
+}
+
+describe() { # $1 = kind, $2 = iface -> notification body detail
+  case "$1" in
+    wifi)
+      _d_ssid=$(wifi_ssid)
+      [ -n "$_d_ssid" ] && printf 'SSID %s' "$_d_ssid" || printf 'default route %s' "$2"
+      ;;
+    mobile) printf 'cellular via %s' "$2" ;;
+    vpn) printf 'tunnel, route via %s' "$2" ;;
+    ethernet) printf 'route via %s' "$2" ;;
+    offline) printf 'no default route' ;;
+    *) printf 'default route %s' "$2" ;;
+  esac
+}
+
+notify() { # $1 = title, $2 = body
+  if command -v android_notify >/dev/null 2>&1; then
+    android_notify "$1" "$2" net-watch && return 0
+  fi
+  log "NOTIFICATION: $1 — $2"
+  return 1
+}
+
+notify_change() { # $1 = old kind, $2 = new kind, $3 = detail
+  case "$2" in
+    offline) _n_title='Network offline' ;;
+    wifi) _n_title='Wi-Fi connected' ;;
+    mobile) _n_title='Mobile data' ;;
+    vpn) _n_title='VPN active' ;;
+    ethernet) _n_title='Ethernet connected' ;;
+    *) _n_title="Network: $2" ;;
+  esac
+  notify "$_n_title" "$3 (was $1)"
+}
+
+last=''
+[ -f "$STATE_FILE" ] && last=$(cat "$STATE_FILE" 2>/dev/null)
+: "${last:=}"
+
+log "watching network (every ${CHECK_INTERVAL}s, stable for ${MIN_STABLE}s, probe ${PROBE_TARGET})"
+
+# A state only fires once it has held for MIN_STABLE seconds, so a quick
+# Wi-Fi/mobile flap never reaches the user.
+pending=''
+pending_since=0
+
+while :; do
+  iface=$(egress_iface)
+  kind=$(kind_of "$iface")
+  now=$(date +%s)
+
+  if [ -z "$last" ]; then
+    # First ever run: adopt whatever is current instead of alerting on boot.
+    last=$kind
+    printf '%s' "$last" >"$STATE_FILE"
+    log "starting from state: $last"
+  elif [ "$kind" = "$last" ]; then
+    pending=''
+  else
+    if [ "$kind" != "$pending" ]; then
+      pending=$kind
+      pending_since=$now
+      log "state -> $kind (confirming for ${MIN_STABLE}s)"
+    fi
+    if [ "$((now - pending_since))" -ge "$MIN_STABLE" ]; then
+      notify_change "$last" "$kind" "$(describe "$kind" "$iface")"
+      log "notified: ${last} -> ${kind}"
+      last=$kind
+      printf '%s' "$last" >"$STATE_FILE"
+      pending=''
+    fi
+  fi
+
+  sleep "$CHECK_INTERVAL"
+done

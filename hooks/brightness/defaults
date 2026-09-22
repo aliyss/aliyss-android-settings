@@ -1,0 +1,11 @@
+# brightness defaults (sourced by the service run script; overridden by the
+# hookConfig env file written by home-manager). Actions are deliberately empty:
+# as an event source it does nothing until the dotfiles configure MODE_ACTION /
+# LEVEL_ACTION.
+CHECK_INTERVAL=30
+STEP=15
+MIN_INTERVAL=60
+LEVEL_IN_AUTO=0
+MODE_ACTION=
+LEVEL_ACTION=
+NOTIFY=0

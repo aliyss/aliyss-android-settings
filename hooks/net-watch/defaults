@@ -1,0 +1,5 @@
+# net-watch defaults (sourced by the service run script; overridden by the
+# hookConfig env file written by home-manager)
+CHECK_INTERVAL=60
+MIN_STABLE=30
+PROBE_TARGET=1.1.1.1

@@ -1,19 +1,19 @@
-# aliyss-android-settings — reference settings manifest
+# default — the manifest applied on every switch (currently: animation scales)
 #
 # Format:
 #   namespace.key = value     namespace is global | system | secure
 #   cmd:<shell command>       run raw as root (ONLY in manifests you trust!)
 #   # / blank lines           ignored
 #
-# Apply:  android-settings apply [FILE...]   (home-manager runs this on switch)
-# Check:  android-settings verify [FILE...]
+# Apply:  android-settings apply [NAME|FILE...]   (home-manager runs this on switch)
+# Check:  android-settings verify [NAME|FILE...]
+#
+# This file is the *enforced* set. The rest of props/ is a commented library of
+# every Quick-Settings-backed knob (display, connectivity, sound, battery,
+# rotation, privacy, quicksettings, system-ui, developer, animation) —
+# `android-settings list-props`, then `android-settings apply display` to use
+# one, or copy the lines you want in here.
 
 global.window_animation_scale = 0.75
 global.transition_animation_scale = 0.75
 global.animator_duration_scale = 0.75
-
-# More examples (uncomment to use):
-# system.screen_off_timeout = 120000           # 2 min
-# global.stay_on_while_plugged_in = 0          # screen off while charging
-# secure.screensaver_enabled = 0               # no daydream
-# cmd:settings put global low_power_sticky 1   # raw command form

@@ -1,0 +1,179 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# notification — watch the shade and dispatch new notifications as events.
+#
+# An event SOURCE for the dotfiles: per new notification it runs a configured
+# root command, so the dotfiles can re-alert the ones that matter (glucose
+# alarms, sleep tracking, a specific chat) without any NotificationListener app.
+#
+# Root polling, no extra app: `cmd notification list` gives the active keys
+# (user|pkg|id|tag|uid), and only when something is new `cmd notification get
+# <key>` fetches that one record for its title/text — the full `dumpsys` is only
+# needed for debugging, never in the loop.
+#
+# Hook contract (aliyss-android-settings): sourced with env, executed natively in
+# Termux under runit, loops forever. Nothing runs until the dotfiles declare the
+# hook — home-manager calls `install-hook`, which creates the service.
+#
+# Env (defaults here; override via hookConfig in home-manager):
+#   CHECK_INTERVAL   seconds between polls                        (default 15)
+#   WATCH_PACKAGES   comma list to limit to (empty = every package)
+#   IGNORE_PACKAGES  comma list to skip              (default com.android.shell,
+#                    which is also what `android-settings notify` posts as —
+#                    ignoring it keeps a mirroring NOTIFY=1 from looping)
+#   ACTION           shell command run as root per new notification
+#   NOTIFY           1 = also post a mirror notification          (default 0)
+#                    Set IGNORE_PACKAGES="" to drop the default shell filter
+#                    (e.g. to also react to `android-settings notify`).
+#
+# Action environment (exported for ACTION):
+#   EVENT=posted
+#   PACKAGE  UID  USER  ID  TAG  KEY
+#   TITLE  TEXT  CHANNEL  IMPORTANCE
+#
+# "New" means a key that was not in the previous poll: a notification that
+# updates in place (same id+tag) does not fire again. A burst fires one action
+# per notification. Actions run detached as root, like key-remap's gestures.
+
+CHECK_INTERVAL=${CHECK_INTERVAL:-15}
+WATCH_PACKAGES=${WATCH_PACKAGES:-}
+# `-` not `:-`: an explicitly empty IGNORE_PACKAGES means "ignore nothing",
+# which is how you watch shell notifications (including android-settings notify).
+IGNORE_PACKAGES=${IGNORE_PACKAGES-com.android.shell}
+ACTION=${ACTION:-}
+NOTIFY=${NOTIFY:-0}
+
+STATE_DIR="$HOME/.local/state/aliyss-android-settings"
+STATE_FILE="$STATE_DIR/state/notification"
+mkdir -p "$STATE_DIR/state"
+
+# Shared helper installed by `android-settings install-hook`.
+NOTIFY_LIB="$HOME/.local/libexec/android-settings/lib/notify.sh"
+[ -f "$NOTIFY_LIB" ] && . "$NOTIFY_LIB"
+
+# su resolution (KernelSU ships su in the Termux prefix here; Magisk on /system).
+SU_BIN=$(command -v su 2>/dev/null || printf /system/bin/su)
+
+# Mirror notifications get this tag; also used as the built-in notification tag.
+MIRROR_TAG=notification-watch
+
+log() { printf '[notification] %s\n' "$(date +%H:%M:%S) $*"; }
+
+esc() { printf '%s' "$1" | sed "s/'/'\\\\''/g"; }
+
+as_root_out() { # $1 = command; prints its stdout
+  "$SU_BIN" -c "PATH=/system/bin:/system/xbin:\$PATH; export PATH; $1" 2>/dev/null
+}
+
+# Observed values are handed to the action through the root shell's environment
+# (a plain export would not survive `su`, which may reset the environment).
+EV_ENV=''
+ev_set() { # $1 = name, $2 = value
+  EV_ENV="$EV_ENV$1='$(esc "$2")'; export $1; "
+}
+
+run_action() { # $1 = command (runs with $EV_ENV in scope)
+  [ -n "$1" ] || return 0
+  log "action: $1"
+  "$SU_BIN" -c "PATH=/system/bin:/system/xbin:\$PATH; export PATH; $EV_ENV$1" >/dev/null 2>&1 &
+}
+
+notify() { # $1 = title, $2 = body
+  if command -v android_notify >/dev/null 2>&1; then
+    android_notify "$1" "$2" "$MIRROR_TAG" && return 0
+  fi
+  log "NOTIFICATION: $1 — $2"
+  return 1
+}
+
+pkg_allowed() { # $1 = package
+  case ",$IGNORE_PACKAGES," in
+    *",$1,"*) return 1 ;;
+  esac
+  [ -n "$WATCH_PACKAGES" ] || return 0
+  case ",$WATCH_PACKAGES," in
+    *",$1,"*) return 0 ;;
+  esac
+  return 1
+}
+
+# Active notification keys, filtered and sorted. The ranker's own group
+# summaries (…|ranker_group|…) appear and vanish on their own — pure noise.
+current_keys() {
+  as_root_out "cmd notification list" |
+    while IFS='|' read -r user pkg id tag uid _rest; do
+      [ -n "$pkg" ] || continue
+      [ "$tag" = ranker_group ] && continue
+      pkg_allowed "$pkg" || continue
+      printf '%s|%s|%s|%s|%s\n' "$user" "$pkg" "$id" "$tag" "$uid"
+    done | sort
+}
+
+# One field out of a `cmd notification get` record.
+rec_field() { # $1 = record, $2 = sed expression
+  printf '%s\n' "$1" | sed -n "$2" | head -n 1
+}
+
+dispatch() { # $1 = key
+  key=$1
+  # Split with IFS, not with ${x%%|*}: `|` in a pattern is alternation under
+  # mksh, which would silently hand the action empty fields.
+  IFS='|' read -r user pkg id tag uid _rest <<EOF
+$key
+EOF
+
+  rec=$(as_root_out "cmd notification get '$(esc "$key")'")
+  # extras print as `android.title=String (…)`; the type name varies
+  # (String / SpannableString / CharSequence), so match any word.
+  title=$(rec_field "$rec" 's/^ *android\.title=[A-Za-z]* (\(.*\))$/\1/p')
+  text=$(rec_field "$rec" 's/^ *android\.text=[A-Za-z]* (\(.*\))$/\1/p')
+  # Stop at space/comma/')': the record line ends `Notification(channel=id …))`.
+  channel=$(rec_field "$rec" 's/.*channel=\([^ ,)]*\).*/\1/p')
+  importance=$(rec_field "$rec" 's/.*importance=\([0-9]*\).*/\1/p')
+  case "$title" in null) title='' ;; esac
+  case "$text" in null) text='' ;; esac
+  case "$channel" in null) channel='' ;; esac
+
+  log "$pkg: ${title:-<no title>}${text:+ — $text}"
+
+  EV_ENV=''
+  ev_set EVENT posted
+  ev_set PACKAGE "$pkg"
+  ev_set UID "$uid"
+  ev_set USER "$user"
+  ev_set ID "$id"
+  ev_set TAG "$tag"
+  ev_set KEY "$key"
+  ev_set TITLE "$title"
+  ev_set TEXT "$text"
+  ev_set CHANNEL "$channel"
+  ev_set IMPORTANCE "$importance"
+
+  run_action "$ACTION"
+
+  if [ "$NOTIFY" = 1 ]; then
+    notify "${title:-Notification from $pkg}" "${text:-$pkg}"
+  fi
+}
+
+log "watching notifications (every ${CHECK_INTERVAL}s, packages: ${WATCH_PACKAGES:-all}, ignoring: ${IGNORE_PACKAGES:-none}, action: ${ACTION:+set})"
+
+while :; do
+  cur=$(current_keys)
+
+  if [ ! -f "$STATE_FILE" ]; then
+    # First ever run: remember what is already there instead of replaying the
+    # whole shade as events.
+    printf '%s\n' "$cur" >"$STATE_FILE"
+    log "adopted $(printf '%s\n' "$cur" | grep -c . || true) existing notifications"
+  else
+    new=$(printf '%s\n' "$cur" | grep -Fxv -f "$STATE_FILE" 2>/dev/null || true)
+    if [ -n "$new" ]; then
+      printf '%s\n' "$new" | while IFS= read -r key; do
+        [ -n "$key" ] && dispatch "$key"
+      done
+    fi
+    printf '%s\n' "$cur" >"$STATE_FILE"
+  fi
+
+  sleep "$CHECK_INTERVAL"
+done

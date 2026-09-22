@@ -1,0 +1,8 @@
+# rotation — auto-rotate (QS "Auto-rotate"), locked orientation, rotate suggestions
+#
+# The props/ files are the *library*: everything is commented out, uncomment what
+# you want and apply the file by name (see display.props for the workflow).
+
+# system.accelerometer_rotation = 1              # 1 = auto-rotate on, 0 = rotation locked
+# system.user_rotation = 0                       # 0=0deg 1=90deg 2=180deg 3=270deg (used when locked)
+# secure.show_rotation_suggestions = 0           # "Rotate" button in the nav bar

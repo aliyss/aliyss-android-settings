@@ -1,0 +1,36 @@
+# quicksettings — the Quick Settings panel itself: which tiles, in what order
+#
+# The props/ files are the *library*: everything is commented out, uncomment what
+# you want and apply the file by name (see display.props for the workflow).
+#
+# Two ways to edit the panel. Prefer the first:
+#
+#   qs.add = flashlight,screenrecord     # ensure tiles are present (merge)
+#   qs.remove = cast,nfc                 # ensure tiles are absent (merge)
+#
+# These read the live list, patch only the tiles you name, write it back, and
+# restart SystemUI — so they are idempotent and safe to verify. Or control them
+# from the shell:
+#
+#   android-settings qs-list
+#   android-settings qs-add flashlight screenrecord
+#   android-settings qs-remove cast nfc
+#
+# The full replace below is also possible, but it clobbers whatever the phone
+# added since. Read the live value first — it is the source of truth:
+#
+#   adb shell settings get secure sysui_qs_tiles
+#
+# Specs are AOSP names (internet, cell, wifi, bt, flashlight, dnd, alarm,
+# airplane, rotation, battery, cast, screenrecord, hotspot, nfc, night, dark,
+# saver, location, datasaver); Nothing OS uses the same ones. On Android 12+ the
+# "internet" tile replaces the old separate wifi/cell tiles.
+
+# qs.add = flashlight
+# qs.remove = cast
+# secure.sysui_qs_tiles = internet,bt,flashlight,dnd,airplane,rotation,battery,cast,screenrecord,hotspot,nfc,night,location,datasaver
+# secure.sysui_qqs_count = 6                     # tiles shown collapsed (Android 12 and older)
+
+# SystemUI is restarted automatically after a change; do it by hand if you
+# edited sysui_qs_tiles outside this tool:
+# cmd:killall com.android.systemui

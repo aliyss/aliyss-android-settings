@@ -1,0 +1,49 @@
+# connectivity — Wi-Fi, mobile data, airplane mode, Bluetooth, NFC, data saver, hotspot, private DNS
+#
+# The props/ files are the *library*: everything is commented out, uncomment what
+# you want and apply the file by name (see display.props for the workflow).
+#
+# State toggles a plain `settings put` cannot flip cleanly use `cmd:` lines —
+# the engine runs those as root and the ROM's service reacts properly. The
+# plain `global.*_on` keys are mirrors: useful to read/verify, risky to write.
+
+# --- Wi-Fi (QS "Internet") ---
+# cmd:svc wifi enable
+# cmd:svc wifi disable
+# global.wifi_on = 1                             # mirror only; toggle with svc
+# global.wifi_scan_always_enabled = 0            # "Scanning always available"
+# global.wifi_wakeup_enabled = 1                 # turn Wi-Fi on near saved networks
+# global.wifi_networks_available_notification_on = 0
+
+# --- Mobile data (QS "Internet") ---
+# cmd:svc data enable
+# cmd:svc data disable
+# global.mobile_data = 1                         # per-SIM on dual-SIM devices
+# global.data_roaming_enabled = 0
+
+# --- Airplane mode (QS) ---
+# cmd:cmd connectivity airplane-mode enable
+# cmd:cmd connectivity airplane-mode disable
+# global.airplane_mode_on = 0                    # mirror; the cmd above is the correct toggle
+
+# --- Bluetooth (QS) ---
+# cmd:svc bluetooth enable
+# cmd:svc bluetooth disable
+# global.bluetooth_on = 0                        # mirror only; toggle with svc
+
+# --- NFC (QS) ---
+# cmd:svc nfc enable
+# cmd:svc nfc disable
+
+# --- Data Saver (QS) ---
+# cmd:cmd netpolicy set restrict-background true
+# cmd:cmd netpolicy set restrict-background false
+
+# --- Hotspot / tethering (QS) ---
+# cmd:cmd wifi start-softap MySSID open          # Android 13+; add a passphrase for WPA
+# cmd:cmd wifi stop-softap
+# global.soft_ap_timeout_enabled = 1
+
+# --- Private DNS (Quick-Tile-Settings style tile) ---
+# global.private_dns_mode = off                  # off | opportunistic | hostname
+# global.private_dns_specifier = dns.example.com # only used when mode = hostname

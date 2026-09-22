@@ -1,0 +1,8 @@
+# notification defaults (sourced by the service run script; overridden by the
+# hookConfig env file written by home-manager). ACTION is deliberately empty: as
+# an event source it does nothing until the dotfiles configure it.
+CHECK_INTERVAL=15
+WATCH_PACKAGES=
+IGNORE_PACKAGES=com.android.shell
+ACTION=
+NOTIFY=0

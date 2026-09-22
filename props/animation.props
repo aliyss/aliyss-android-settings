@@ -1,0 +1,11 @@
+# animation — window/transition/animator scales (Developer options)
+#
+# These three are the ones default.props enforces on every switch; kept here so
+# the library lists every knob in one place. Apply alone with:
+#   android-settings apply animation
+#
+# 0 = animations off, 0.5/0.75 = snappier, 1.0 = stock Android.
+
+global.window_animation_scale = 0.75
+global.transition_animation_scale = 0.75
+global.animator_duration_scale = 0.75

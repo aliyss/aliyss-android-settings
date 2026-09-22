@@ -1,0 +1,22 @@
+# privacy — location (QS "Location"), scanning, lock-screen privacy
+#
+# The props/ files are the *library*: everything is commented out, uncomment what
+# you want and apply the file by name (see display.props for the workflow).
+#
+# The QS "Camera access" / "Mic access" / "Sensors Off" toggles go through
+# SensorPrivacyManager and have no stable settings key — use the tiles (or
+# `cmd sensor_privacy`, ROM-dependent) instead of this manifest.
+
+# --- Location (QS "Location") ---
+# cmd:cmd location set-location-enabled true
+# cmd:cmd location set-location-enabled false
+# secure.location_mode = 3                       # 0 off, 1 device only, 2 battery saving, 3 high accuracy
+# secure.location_providers_allowed = gps,network # legacy form (pre-Android 9)
+
+# --- Wi-Fi / Bluetooth scanning (both feed the Location tile) ---
+# global.wifi_scan_always_enabled = 0
+# global.ble_scan_always_enabled = 0
+
+# --- Lock screen privacy ---
+# secure.lock_screen_show_notifications = 1
+# secure.lock_screen_allow_private_notifications = 1

@@ -308,6 +308,18 @@ Manifests and hooks run **as root** (`su`) where needed — this repo is part
 of the trusted flake, same as the android-pkgs installer. Never apply a
 manifest you did not read (`cmd:` lines are arbitrary root commands).
 
+### Root when `su` is not reachable
+
+The engine resolves `su` from `PATH` and the usual locations, but it **probes**
+each candidate (`su -c 'id -u'`) rather than trusting the name: inside the Nix
+chroot the Termux `su` stub sits on `PATH` and always fails, while the real
+`/system/bin/su` and `/data/adb` are not mounted. When no candidate elevates, it
+falls back to KernelSU's ksud CLI through a generated `su -c` shim
+(`~/.local/state/aliyss-android-settings/su-ksud`) — the same route the
+interactive fish `su`/`sudo` functions take. That is what lets a home-manager
+activation get root inside the chroot; `$SU_BIN` keeps its `su -c` contract
+either way, so `lib/notify.sh` and friends need no special case.
+
 ## Repo layout
 
 ```

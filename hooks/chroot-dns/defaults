@@ -1,0 +1,7 @@
+# chroot-dns defaults (sourced by the service run script; overridden by the
+# hookConfig env file written by home-manager)
+CHECK_INTERVAL=300
+INET_GID=3003
+TERMUX_UID=10393
+TERMUX_GID=10393
+NOTIFY=1

@@ -1,0 +1,9 @@
+# schedule defaults (sourced by the service run script; overridden by the
+# hookConfig env file written by home-manager). Empty SCHEDULES means the hook
+# runs but does nothing.
+#
+#   SCHEDULES="07:30|cmd uimode night no;22:00|cmd uimode night yes"
+SCHEDULES=
+CHECK_INTERVAL=30
+GRACE=2
+NOTIFY=0

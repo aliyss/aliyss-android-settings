@@ -1,0 +1,10 @@
+AC powered: false
+USB powered: false
+Wireless powered: false
+Max charging current: 0
+  status: 3
+  health: 2
+  level: 10
+  voltage: 3700
+  temperature: 350
+  technology: Li-ion

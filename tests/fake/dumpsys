@@ -1,0 +1,15 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# dumpsys(1) stand-in for the test suite.
+#
+# Prints $AS_TEST_DUMPSYS_DIR/<service> when a fixture for that service exists
+# (`dumpsys battery` -> battery, `dumpsys power` -> power), and nothing
+# otherwise. A test writes the fixture it needs, so a hook's parsing is exercised
+# against a controlled device instead of the phone it happens to run on.
+
+DIR=${AS_TEST_DUMPSYS_DIR:-}
+SERVICE=${1:-}
+
+if [ -n "$DIR" ] && [ -n "$SERVICE" ] && [ -f "$DIR/$SERVICE" ]; then
+  cat "$DIR/$SERVICE"
+fi
+exit 0

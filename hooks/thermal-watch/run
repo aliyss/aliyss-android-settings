@@ -1,0 +1,119 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# thermal-watch — warn before the phone gets hot, and follow the thermal throttle.
+#
+# Two signals, both read from one root shell per poll:
+#   - battery temperature, from `dumpsys battery` (tenths of a degree);
+#   - the platform thermal status, from `dumpsys thermalservice`.
+#
+# Temperature alerts use the same hysteresis as battery-low: fire at MAX_TEMP,
+# stay quiet until it drops back to REARM_TEMP, so a phone hovering on the
+# threshold does not notify on every poll.
+#
+# Hook contract (aliyss-android-settings): sourced with env, executed natively in
+# Termux under runit, loops forever.
+#
+# Env (defaults here, override via hookConfig in home-manager):
+#   CHECK_INTERVAL  seconds between polls                        (default 120)
+#   MAX_TEMP        notify at/above this battery temp in C        (default 42)
+#   REARM_TEMP      re-arm at/below this temp in C                (default 40)
+#   STATUS_ALERT    notify when thermal status reaches this level (default 2)
+#                   0 none, 1 light, 2 moderate, 3 severe, 4 critical, 5 emergency
+#   HOT_ACTION      shell command run as root when MAX_TEMP is hit
+#   ACTION          shared fallback when HOT_ACTION is empty
+#   NOTIFY          1 = post a notification                        (default 1)
+#
+# Action environment (for HOT_ACTION / ACTION): EVENT=hot, TEMP, PREV_TEMP,
+# PERCENT_TEMP (0-100 scale), STATUS, PREV_STATUS.
+
+HOOK_LIB_DIR="${HOOK_LIB_DIR:-$HOME/.local/libexec/android-settings/lib}"
+. "$HOOK_LIB_DIR/hook.sh"
+. "$HOOK_LIB_DIR/poll.sh"
+hook_log_init thermal-watch
+
+CHECK_INTERVAL=${CHECK_INTERVAL:-120}
+MAX_TEMP=${MAX_TEMP:-42}
+REARM_TEMP=${REARM_TEMP:-40}
+STATUS_ALERT=${STATUS_ALERT:-2}
+HOT_ACTION=${HOT_ACTION:-}
+ACTION=${ACTION:-}
+NOTIFY=${NOTIFY:-1}
+
+# Sets temp_c (Celsius, integer) and thermal (status level, may be empty).
+read_thermal() {
+  _tw_dump=$(as_root_out "dumpsys battery | grep -m1 temperature: ; dumpsys thermalservice | grep -m1 'Thermal Status'") || return 1
+  _tw_raw=$(printf '%s\n' "$_tw_dump" | sed -n 's/^ *temperature: *\([0-9][0-9-]*\).*/\1/p' | head -n 1)
+  [ -n "$_tw_raw" ] || return 1
+  # Tenths of a degree; integer maths keeps this shell-only.
+  temp_c=$((_tw_raw / 10))
+  thermal=$(printf '%s\n' "$_tw_dump" |
+    sed -n 's/.*Thermal Status: *\([0-9][0-9]*\).*/\1/p' | head -n 1)
+  return 0
+}
+
+hot_action() {
+  log "hot: ${temp_c}C (alert at ${MAX_TEMP}C, was ${prev_temp:-?}C)"
+  ev_run EVENT hot TEMP "$temp_c" PREV_TEMP "$prev_temp" \
+    PERCENT_TEMP "$((temp_c * 100 / MAX_TEMP))" \
+    STATUS "$thermal" PREV_STATUS "$prev_thermal" \
+    "${HOT_ACTION:-$ACTION}"
+  [ "$NOTIFY" = 1 ] && hook_notify 'Phone is warm' \
+    "${temp_c}C (alert at ${MAX_TEMP}C, thermal status ${thermal:-?})" thermal-watch
+}
+
+status_action() { # $1 = new status
+  log "thermal status $1 (was ${prev_thermal:-?})"
+  [ "$NOTIFY" = 1 ] && hook_notify "Thermal throttle $1" \
+    "Platform thermal status reached $1 (temp ${temp_c}C)" thermal-watch
+}
+
+fired=$(state_get thermal-watch.fired)
+: "${fired:=0}"
+
+prev_temp=''
+prev_thermal=''
+[ -f "$(state_path thermal-watch.adopted)" ] && {
+  read -r fired prev_temp prev_thermal <"$(state_path thermal-watch)" 2>/dev/null || true
+}
+
+step() {
+  if ! read_thermal; then
+    log "thermal read failed (su denied? no root?)"
+    return 0
+  fi
+
+  if poll_is_first_run thermal-watch; then
+    poll_mark_adopted thermal-watch
+    prev_temp=$temp_c
+    prev_thermal=$thermal
+    state_set thermal-watch "$fired $prev_temp $prev_thermal"
+    log "starting from ${temp_c}C (thermal status ${thermal:-?})"
+    return 0
+  fi
+
+  # Hysteresis, same shape as battery-low.
+  if [ "$fired" -eq 1 ] && [ "$temp_c" -le "$REARM_TEMP" ]; then
+    log "re-armed (${temp_c}C <= ${REARM_TEMP}C)"
+    fired=0
+  fi
+  if [ "$fired" -eq 0 ] && [ "$temp_c" -ge "$MAX_TEMP" ]; then
+    hot_action
+    fired=1
+  fi
+
+  # A rising thermal status is worth knowing about even below MAX_TEMP; only
+  # report on the transition into an at-or-above-STATUS_ALERT level.
+  if [ -n "$thermal" ] && [ "$thermal" != "$prev_thermal" ]; then
+    if [ "$thermal" -ge "$STATUS_ALERT" ] 2>/dev/null; then
+      case "${prev_thermal:-0}" in
+        '' | 0 | 1) status_action "$thermal" ;;
+      esac
+    fi
+    prev_thermal=$thermal
+  fi
+
+  prev_temp=$temp_c
+  state_set thermal-watch "$fired $prev_temp $prev_thermal"
+}
+
+log "watching thermals (every ${CHECK_INTERVAL}s, alert ${MAX_TEMP}C, re-arm ${REARM_TEMP}C, status alert ${STATUS_ALERT})"
+poll_start step

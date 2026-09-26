@@ -1,0 +1,121 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# watchdog — keep the android-settings services running.
+#
+# runit restarts a hook that exits, but its supervision can itself stop: runsvdir
+# dies, a supervise directory is left behind without a runsv, a service is
+# `sv down`-ed by hand (or by a half-finished remove). Those cases are silent —
+# the hook simply stops producing log lines — and the note in the dotfiles about
+# a termux-services wedge is exactly this failure mode.
+#
+# This hook asks `sv status` for every android-settings service on an interval,
+# brings back anything that is not `run`, and reports the transitions. It is
+# deliberately quiet: healthy ticks produce no log line, so its own log stays a
+# short history of actual incidents.
+#
+# Hook contract (aliyss-android-settings): sourced with env, executed natively in
+# Termux under runit, loops forever.
+#
+# Env (defaults here, override via hookConfig in home-manager):
+#   CHECK_INTERVAL  seconds between checks                       (default 60)
+#   WATCH           comma/space separated service names to watch; names may omit
+#                   the android-settings- prefix. Empty = every service         (default empty)
+#   RESTART         1 = `sv up` anything not running             (default 1)
+#   NOTIFY          1 = notify when a service goes down or comes back (default 0)
+#
+# Watching a service that is not installed is not an error: names the dotfiles
+# no longer declare are skipped, so WATCH can be a list written once.
+
+HOOK_LIB_DIR="${HOOK_LIB_DIR:-$HOME/.local/libexec/android-settings/lib}"
+. "$HOOK_LIB_DIR/hook.sh"
+. "$HOOK_LIB_DIR/poll.sh"
+hook_log_init watchdog
+
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+CHECK_INTERVAL=${CHECK_INTERVAL:-60}
+WATCH=${WATCH:-}
+RESTART=${RESTART:-1}
+NOTIFY=${NOTIFY:-0}
+SERVICE_BASE="$PREFIX/var/service"
+
+sv_bin() {
+  if command -v sv >/dev/null 2>&1; then
+    command -v sv
+  else
+    printf '%s/bin/sv' "$PREFIX"
+  fi
+}
+
+status_of() { # $1 = full service name; prints sv status stdout (empty = absent)
+  SVDIR="$SERVICE_BASE" "$(sv_bin)" status "$1" 2>/dev/null
+}
+
+service_names() {
+  for _wd_d in "$SERVICE_BASE"/android-settings-*; do
+    [ -d "$_wd_d" ] || continue
+    basename "$_wd_d"
+  done
+}
+
+watched_names() {
+  if [ -n "$WATCH" ]; then
+    for _wd_n in $(printf '%s' "$WATCH" | tr ',' ' '); do
+      case "$_wd_n" in
+        android-settings-*) printf '%s\n' "$_wd_n" ;;
+        *) printf 'android-settings-%s\n' "$_wd_n" ;;
+      esac
+    done
+  else
+    service_names
+  fi
+}
+
+prev_down=''
+[ -f "$(state_path watchdog.adopted)" ] && prev_down=$(state_get watchdog.down)
+
+step() {
+  down=''
+  for name in $(watched_names); do
+    [ -d "$SERVICE_BASE/$name" ] || continue
+    st=$(status_of "$name")
+    case "$st" in
+      run:*) continue ;;
+    esac
+    down="$down $name"
+    if [ "$RESTART" = 1 ]; then
+      if SVDIR="$SERVICE_BASE" "$(sv_bin)" up "$name" >/dev/null 2>&1; then
+        log "brought up: $name (was: ${st:-not supervised})"
+      else
+        log "could not bring up: $name (was: ${st:-not supervised})"
+      fi
+    fi
+  done
+
+  if poll_is_first_run watchdog; then
+    poll_mark_adopted watchdog
+    prev_down=$down
+    state_set watchdog.down "$down"
+    if [ -n "$down" ]; then
+      log "starting with services not running:$down"
+    else
+      log "starting: every android-settings service is running"
+    fi
+    return 0
+  fi
+
+  [ "$down" = "$prev_down" ] || {
+    if [ -n "$down" ] && [ -z "$prev_down" ]; then
+      log "services down:$down"
+      [ "$NOTIFY" = 1 ] && hook_notify 'Hook service down' "not running:$down" watchdog
+    elif [ -z "$down" ]; then
+      log "all services running again (was:$prev_down)"
+      [ "$NOTIFY" = 1 ] && hook_notify 'Hook services recovered' "running again (was:$prev_down)" watchdog
+    elif [ -n "$down" ]; then
+      log "services down:$down (was:$prev_down)"
+    fi
+    prev_down=$down
+    state_set watchdog.down "$down"
+  }
+}
+
+log "watching services (every ${CHECK_INTERVAL}s, restart: $RESTART, list: ${WATCH:-all})"
+poll_start step

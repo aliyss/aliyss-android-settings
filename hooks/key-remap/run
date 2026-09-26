@@ -7,6 +7,11 @@
 # Hook contract (aliyss-android-settings): sourced with env, executed
 # natively in Termux under runit. Loops forever.
 #
+# This hook is event-driven rather than polling, so it uses only hook.sh's
+# logging and root helpers — actions go out through as_root_detached, which
+# resolves su the same way the engine does (probe, then the ksud shim when the
+# real su is hidden inside the Nix chroot).
+#
 # Env (defaults here; override via hookConfig in home-manager):
 #   SCANCODE        scancode of the key, hex WITHOUT 0x (default 00fa =
 #                   the Essential Key; getevent prints it as 0xfa)
@@ -37,34 +42,32 @@
 # Test/offline: set DEVICE_CMD to supply events instead of starting getevent,
 # e.g. DEVICE_CMD="cat captured.log" and NO_CLEANUP=1.
 
+HOOK_LIB_DIR="${HOOK_LIB_DIR:-$HOME/.local/libexec/android-settings/lib}"
+. "$HOOK_LIB_DIR/hook.sh"
+hook_log_init key-remap
+
 SCANCODE=${SCANCODE:-00fa}
 LONG_PRESS_MS=${LONG_PRESS_MS:-500}
 DOUBLE_PRESS_MS=${DOUBLE_PRESS_MS:-350}
 KEY_DEVICE=${KEY_DEVICE:-/dev/input/event0}
 TICK=${TICK:-0.05}
 
-STATE_DIR="$HOME/.local/state/aliyss-android-settings"
 mkdir -p "$STATE_DIR/logs"
 
 # Scancode exactly as getevent prints it (4 lowercase hex digits).
 SC_HEX=$(printf '%04x' "0x$SCANCODE")
 
-log() { printf '[key-remap] %s\n' "$(date +%H:%M:%S) $*"; }
 now_ms() { date +%s%3N; }
 
 # Milliseconds between two kernel timestamps (float seconds).
 ms_between() { awk "BEGIN{printf \"%d\", (\"$1\" - \"$2\") * 1000}"; }
-
-# Run a command as root, detached. The root shell gets no useful PATH on this
-# phone (KernelSU), so pin one.
-su_run() { /system/bin/su -c "PATH=/system/bin:\$PATH; export PATH; $1" >/dev/null 2>&1 & }
 
 fire() { # $1 = action env var name, $2 = gesture label
   local cmd
   eval "cmd=\${$1}"
   [ -n "$cmd" ] || return 0
   log "$2 -> running action"
-  su_run "$cmd"
+  as_root_detached "$cmd"
 }
 
 # ---- state machine ----------------------------------------------------------
@@ -159,7 +162,9 @@ if [ -z "$DEVICE_CMD" ] && [ -z "$NO_CLEANUP" ]; then
   for _p in $(pgrep -f "android-settings/hooks/key-remap/run" 2>/dev/null); do
     [ "$_p" = "$$" ] || kill "$_p" 2>/dev/null || true
   done
-  /system/bin/su -c 'kill $(pidof getevent) 2>/dev/null' >/dev/null 2>&1 || true
+  # Single quotes are the point: $(pidof) must expand inside the ROOT shell.
+  # shellcheck disable=SC2016
+  as_root 'kill $(pidof getevent) 2>/dev/null' >/dev/null 2>&1 || true
   sleep 1
 fi
 

@@ -1,0 +1,56 @@
+# apps — per-app ops (background, notifications, wakelocks), standby buckets, default-app roles, force-stop
+#
+# The props/ files are the *library*: everything is commented out, uncomment what
+# you want and apply the file by name (see display.props for the workflow).
+#
+# Nothing here is a `namespace.key` setting: per-app state lives in appops, in
+# the activity manager and in the role manager, so every line is a `cmd:` line.
+# The engine runs those as root, and `verify` reports them as *not verifiable* —
+# read them back with the matching get/list command instead (each section has
+# one).
+#
+# App *disabling* mostly does not belong here: it has a first-class reversible
+# path (`android-settings disable-app`, declarative via
+# `aliyss.androidSettings.disabledApps`) and the raw `pm disable-user` line at the
+# bottom is only the form underneath it.
+
+# --- Background restrictions (the polite battery fix) ---
+# cmd:cmd appops set com.example.app RUN_IN_BACKGROUND ignore
+# cmd:cmd appops set com.example.app RUN_ANY_IN_BACKGROUND ignore
+# cmd:cmd appops get com.example.app RUN_IN_BACKGROUND     # read it back
+# cmd:cmd appops reset com.example.app                      # undo every op for this app
+
+# --- Standby buckets (how hard the system throttles the app) ---
+# cmd:am set-standby-bucket com.example.app active
+#   buckets: active | working_set | frequent | rare | restricted | never
+# cmd:am get-standby-bucket com.example.app                 # read it back
+
+# --- Per-app notifications and wakelocks ---
+# cmd:cmd appops set com.example.app POST_NOTIFICATION ignore
+# cmd:cmd appops set com.example.app WAKE_LOCK ignore
+# cmd:cmd appops set com.example.app VIBRATE ignore
+
+# --- Per-app location / camera / mic (what the privacy dashboard shows) ---
+# cmd:cmd appops set com.example.app FINE_LOCATION ignore
+# cmd:cmd appops set com.example.app COARSE_LOCATION ignore
+# cmd:cmd appops set com.example.app CAMERA ignore
+# cmd:cmd appops set com.example.app RECORD_AUDIO ignore
+#   modes: allow | ignore | deny | default | foreground
+
+# --- Default-app roles (browser, dialer, SMS, launcher, ...) ---
+# cmd:cmd role add-role-holder android.app.role.BROWSER com.example.browser
+# cmd:cmd role remove-role-holder android.app.role.BROWSER com.example.browser
+# cmd:cmd role get-role-holders android.app.role.BROWSER    # read it back
+#   roles: android.app.role.BROWSER | DIALER | SMS | HOME |
+#          CALL_SCREENING | EMERGENCY | ASSISTANT
+
+# --- Stop an app (no state change; it just loses its processes) ---
+# cmd:am force-stop com.example.app
+
+# --- Raw disabling (prefer `android-settings disable-app`, which is tracked) ---
+# cmd:pm disable-user --user 0 com.example.app
+# cmd:pm enable com.example.app
+
+# --- Read-only surveys (safe) ---
+# cmd:pm list packages -d                                   # every disabled package
+# cmd:cmd appops get com.example.app                         # every op for one app

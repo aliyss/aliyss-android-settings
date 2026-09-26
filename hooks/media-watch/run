@@ -1,0 +1,108 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# media-watch — dispatch media playback changes as events.
+#
+# An event SOURCE for the dotfiles: "something started playing -> don't enable
+# DND", "paused -> dim the screen". It reads the active session from
+# `dumpsys media_session` as root, so it needs no media-notification listener.
+#
+# Caveat, and the reason this file is shorter than its neighbours: the
+# `dumpsys media_session` record layout is not a stable API. The state field is
+# parsed defensively (a missing state simply produces no event), and the metadata
+# (description/artist) is best-effort — a ROM that phrases it differently yields
+# an empty TITLE rather than a wrong one. Actions get whatever was parsed.
+#
+# Hook contract (aliyss-android-settings): sourced with env, executed natively in
+# Termux under runit, loops forever.
+#
+# Env (defaults here; override via hookConfig in home-manager):
+#   CHECK_INTERVAL  seconds between polls                        (default 10)
+#   PLAY_ACTION     shell command run as root when playback starts
+#   PAUSE_ACTION    ... when it pauses or stops
+#   ACTION          shared fallback when the event-specific one is empty
+#   NOTIFY          1 = also post a built-in notification        (default 0)
+#
+# Action environment:
+#   EVENT=playing|paused|stopped|buffering|state_N   PREV_EVENT=...
+#   STATE / PREV_STATE        raw PlaybackState number
+#   TITLE  ARTIST             best-effort, may be empty
+#
+# The first run adopts the current state instead of firing on boot. Actions run
+# detached as root, so a slow command cannot stall the poll loop.
+
+HOOK_LIB_DIR="${HOOK_LIB_DIR:-$HOME/.local/libexec/android-settings/lib}"
+. "$HOOK_LIB_DIR/hook.sh"
+. "$HOOK_LIB_DIR/poll.sh"
+hook_log_init media-watch
+
+CHECK_INTERVAL=${CHECK_INTERVAL:-10}
+PLAY_ACTION=${PLAY_ACTION:-}
+PAUSE_ACTION=${PAUSE_ACTION:-}
+ACTION=${ACTION:-}
+NOTIFY=${NOTIFY:-0}
+
+# Sets play_state (name), raw_state (number, may be empty), title, artist.
+read_media() {
+  _mw_out=$(as_root_out "dumpsys media_session")
+  raw_state=$(printf '%s\n' "$_mw_out" |
+    sed -n 's/.*state=PlaybackState {state=\([0-9][0-9]*\).*/\1/p' | head -n 1)
+  _mw_meta=$(printf '%s\n' "$_mw_out" | grep -m1 'description=' || true)
+  title=$(printf '%s' "$_mw_meta" | sed -n 's/.*description=\([^,]*\).*/\1/p')
+  # The field after description is the artist in the usual layout.
+  artist=$(printf '%s' "$_mw_meta" | sed -n 's/.*description=[^,]*,\([^,]*\).*/\1/p')
+  case "$title" in null) title='' ;; esac
+  case "$artist" in null) artist='' ;; esac
+  case "$raw_state" in
+    0 | 1) play_state=stopped ;;
+    2) play_state=paused ;;
+    3) play_state=playing ;;
+    6) play_state=buffering ;;
+    '') play_state='' ;;
+    *) play_state="state_$raw_state" ;;
+  esac
+}
+
+emit() { # $1 = new state, $2 = previous
+  case "$1" in
+    playing) _mw_cmd=${PLAY_ACTION:-$ACTION} ;;
+    paused | stopped) _mw_cmd=${PAUSE_ACTION:-$ACTION} ;;
+    *) _mw_cmd=${ACTION:-} ;;
+  esac
+  log "$1${title:+ — $title}${artist:+ ($artist)}${2:+ [was $2]}"
+  ev_run \
+    EVENT "$1" PREV_EVENT "$2" \
+    STATE "$raw_state" PREV_STATE "$prev_raw" \
+    TITLE "$title" ARTIST "$artist" \
+    "$_mw_cmd"
+  [ "$NOTIFY" = 1 ] && hook_notify "Media $1" "${title:-unknown track}${artist:+ — $artist}" media-watch
+  return 0
+}
+
+prev=''
+prev_raw=''
+[ -f "$(state_path media-watch.adopted)" ] && {
+  read -r prev prev_raw <"$(state_path media-watch)" 2>/dev/null || true
+}
+
+step() {
+  read_media
+  [ -n "$play_state" ] || return 0
+
+  if poll_is_first_run media-watch; then
+    poll_mark_adopted media-watch
+    prev=$play_state
+    prev_raw=$raw_state
+    state_set media-watch "$prev $prev_raw"
+    log "starting from $prev${title:+ ($title)}"
+    return 0
+  fi
+
+  [ "$play_state" != "$prev" ] || { prev_raw=$raw_state; return 0; }
+  _mw_prev=$prev
+  prev=$play_state
+  state_set media-watch "$prev $raw_state"
+  emit "$play_state" "$_mw_prev"
+  prev_raw=$raw_state
+}
+
+log "watching media playback (every ${CHECK_INTERVAL}s)"
+poll_start step

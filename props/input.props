@@ -1,0 +1,33 @@
+# input — default keyboard (IME), enabled keyboards, autofill, pointer and key timing
+#
+# The props/ files are the *library*: everything is commented out, uncomment what
+# you want and apply the file by name (see display.props for the workflow).
+#
+# On modern Android the keyboard's *live* state is held by InputMethodManager, not
+# by the settings rows below: the rows are what the framework reads at boot and
+# what the Settings UI writes, so they round-trip with `settings put/get`, but to
+# switch keyboard right now use `ime set` (see the bottom).
+
+# --- Default keyboard ---
+# secure.default_input_method = com.example.keyboard/.KeyboardService
+#   The id must match an installed IME exactly (see `ime list -a -s` below).
+
+# --- Enabled keyboards (colon-separated when there is more than one) ---
+# secure.enabled_input_methods = com.example.keyboard/.KeyboardService
+# secure.enabled_input_methods = com.a/.A:com.b/.B
+
+# --- Autofill and spell-check services ---
+# secure.autofill_service = com.example/.AutofillService
+# secure.autofill_service = null                 # turn autofill off
+
+# --- Pointer speed (mouse/trackpad) and hardware-keyboard behaviour ---
+# system.pointer_speed = 0                       # 0-7; also in developer.props
+# secure.show_ime_with_hard_keyboard = 1         # also in developer.props
+#   Hardware key repeat and long-press timing have no stable settings key across
+#   ROMs (they live in the key layout files) — they are not declarative.
+
+# --- Live IME control (immediate; ROM/version-dependent) ---
+# cmd:ime list -a -s                             # every IME, with the current one marked
+# cmd:ime enable com.example.keyboard/.KeyboardService
+# cmd:ime disable com.example.keyboard/.KeyboardService
+# cmd:ime set com.example.keyboard/.KeyboardService

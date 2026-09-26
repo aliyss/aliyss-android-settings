@@ -1,0 +1,35 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# settings(1) stand-in for the test suite: a tiny key/value store in a file.
+#
+#   get NS KEY     -> the value, or `null` when unset (as the real one does)
+#   put NS KEY V   -> upsert
+#
+# The DB path comes from $AS_TEST_DB so a test can point it at its own sandbox
+# (or at a pre-seeded file to simulate drift).
+
+DB=${AS_TEST_DB:-$PWD/settings.db}
+
+case "${1:-}" in
+  get)
+    [ $# -ge 3 ] || { printf 'null\n'; exit 0; }
+    _key="$2.$3"
+    _val=$(awk -v k="$_key" '
+      index($0, k "=") == 1 { print substr($0, length(k) + 2); found = 1; exit }
+    ' "$DB" 2>/dev/null)
+    printf '%s\n' "${_val:-null}"
+    ;;
+  put)
+    [ $# -ge 4 ] || { printf 'fake settings: put needs NS KEY VALUE\n' >&2; exit 2; }
+    _key="$2.$3"
+    : >"$DB.tmp"
+    if [ -f "$DB" ]; then
+      awk -v k="$_key" 'index($0, k "=") == 1 { next } { print }' "$DB" >"$DB.tmp"
+    fi
+    printf '%s=%s\n' "$_key" "$4" >>"$DB.tmp"
+    mv "$DB.tmp" "$DB"
+    ;;
+  *)
+    printf 'fake settings: unsupported: %s\n' "$*" >&2
+    exit 2
+    ;;
+esac

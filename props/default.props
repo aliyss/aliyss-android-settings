@@ -3,10 +3,23 @@
 # Format:
 #   namespace.key = value     namespace is global | system | secure
 #   cmd:<shell command>       run raw as root (ONLY in manifests you trust!)
+#   qs.add / qs.remove        merge tiles into / out of the Quick Settings panel
+#   include NAME|FILE         splice another manifest in here (see below)
 #   # / blank lines           ignored
 #
 # Apply:  android-settings apply [NAME|FILE...]   (home-manager runs this on switch)
 # Check:  android-settings verify [NAME|FILE...]
+# Lint:   android-settings lint [NAME|FILE...]    (offline, no root, no device)
+#
+# `include` is how this file composes the library instead of copying out of it —
+# an included file is spliced where the line sits, so order is the file order:
+#
+#   include animation              # bare name → props/animation.props
+#   include display.props          # a path is relative to the file including it
+#   include /data/…/extra.props    # an absolute path is used as given
+#
+# Run `android-settings lint` after editing a manifest: it checks namespaces,
+# keys, include targets and QS tile names before anything touches the phone.
 #
 # This file is the *enforced* set. The rest of props/ is a commented library of
 # every Quick-Settings-backed knob (display, connectivity, sound, battery,

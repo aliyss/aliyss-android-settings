@@ -14,6 +14,9 @@
 # Termux under runit, loops forever. Nothing runs until the dotfiles declare the
 # hook — home-manager calls `install-hook`, which creates the service.
 #
+# Logging, root, state, the action environment and the loop come from the shared
+# hook libs (lib/hook.sh's ev_run, lib/poll.sh).
+#
 # Env (defaults here; override via hookConfig in home-manager):
 #   CHECK_INTERVAL   seconds between polls                        (default 15)
 #   WATCH_PACKAGES   comma list to limit to (empty = every package)
@@ -34,6 +37,11 @@
 # updates in place (same id+tag) does not fire again. A burst fires one action
 # per notification. Actions run detached as root, like key-remap's gestures.
 
+HOOK_LIB_DIR="${HOOK_LIB_DIR:-$HOME/.local/libexec/android-settings/lib}"
+. "$HOOK_LIB_DIR/hook.sh"
+. "$HOOK_LIB_DIR/poll.sh"
+hook_log_init notification
+
 CHECK_INTERVAL=${CHECK_INTERVAL:-15}
 WATCH_PACKAGES=${WATCH_PACKAGES:-}
 # `-` not `:-`: an explicitly empty IGNORE_PACKAGES means "ignore nothing",
@@ -42,48 +50,8 @@ IGNORE_PACKAGES=${IGNORE_PACKAGES-com.android.shell}
 ACTION=${ACTION:-}
 NOTIFY=${NOTIFY:-0}
 
-STATE_DIR="$HOME/.local/state/aliyss-android-settings"
-STATE_FILE="$STATE_DIR/state/notification"
-mkdir -p "$STATE_DIR/state"
-
-# Shared helper installed by `android-settings install-hook`.
-NOTIFY_LIB="$HOME/.local/libexec/android-settings/lib/notify.sh"
-[ -f "$NOTIFY_LIB" ] && . "$NOTIFY_LIB"
-
-# su resolution (KernelSU ships su in the Termux prefix here; Magisk on /system).
-SU_BIN=$(command -v su 2>/dev/null || printf /system/bin/su)
-
 # Mirror notifications get this tag; also used as the built-in notification tag.
 MIRROR_TAG=notification-watch
-
-log() { printf '[notification] %s\n' "$(date +%H:%M:%S) $*"; }
-
-esc() { printf '%s' "$1" | sed "s/'/'\\\\''/g"; }
-
-as_root_out() { # $1 = command; prints its stdout
-  "$SU_BIN" -c "PATH=/system/bin:/system/xbin:\$PATH; export PATH; $1" 2>/dev/null
-}
-
-# Observed values are handed to the action through the root shell's environment
-# (a plain export would not survive `su`, which may reset the environment).
-EV_ENV=''
-ev_set() { # $1 = name, $2 = value
-  EV_ENV="$EV_ENV$1='$(esc "$2")'; export $1; "
-}
-
-run_action() { # $1 = command (runs with $EV_ENV in scope)
-  [ -n "$1" ] || return 0
-  log "action: $1"
-  "$SU_BIN" -c "PATH=/system/bin:/system/xbin:\$PATH; export PATH; $EV_ENV$1" >/dev/null 2>&1 &
-}
-
-notify() { # $1 = title, $2 = body
-  if command -v android_notify >/dev/null 2>&1; then
-    android_notify "$1" "$2" "$MIRROR_TAG" && return 0
-  fi
-  log "NOTIFICATION: $1 — $2"
-  return 1
-}
 
 pkg_allowed() { # $1 = package
   case ",$IGNORE_PACKAGES," in
@@ -121,7 +89,7 @@ dispatch() { # $1 = key
 $key
 EOF
 
-  rec=$(as_root_out "cmd notification get '$(esc "$key")'")
+  rec=$(as_root_out "cmd notification get '$(as_quote "$key")'")
   # extras print as `android.title=String (…)`; the type name varies
   # (String / SpannableString / CharSequence), so match any word.
   title=$(rec_field "$rec" 's/^ *android\.title=[A-Za-z]* (\(.*\))$/\1/p')
@@ -135,45 +103,37 @@ EOF
 
   log "$pkg: ${title:-<no title>}${text:+ — $text}"
 
-  EV_ENV=''
-  ev_set EVENT posted
-  ev_set PACKAGE "$pkg"
-  ev_set UID "$uid"
-  ev_set USER "$user"
-  ev_set ID "$id"
-  ev_set TAG "$tag"
-  ev_set KEY "$key"
-  ev_set TITLE "$title"
-  ev_set TEXT "$text"
-  ev_set CHANNEL "$channel"
-  ev_set IMPORTANCE "$importance"
-
-  run_action "$ACTION"
+  ev_run \
+    EVENT posted PACKAGE "$pkg" UID "$uid" USER "$user" ID "$id" TAG "$tag" \
+    KEY "$key" TITLE "$title" TEXT "$text" CHANNEL "$channel" \
+    IMPORTANCE "$importance" \
+    "$ACTION"
 
   if [ "$NOTIFY" = 1 ]; then
-    notify "${title:-Notification from $pkg}" "${text:-$pkg}"
+    hook_notify "${title:-Notification from $pkg}" "${text:-$pkg}" "$MIRROR_TAG"
   fi
 }
 
-log "watching notifications (every ${CHECK_INTERVAL}s, packages: ${WATCH_PACKAGES:-all}, ignoring: ${IGNORE_PACKAGES:-none}, action: ${ACTION:+set})"
-
-while :; do
+step() {
   cur=$(current_keys)
 
-  if [ ! -f "$STATE_FILE" ]; then
+  if poll_is_first_run notification; then
     # First ever run: remember what is already there instead of replaying the
     # whole shade as events.
-    printf '%s\n' "$cur" >"$STATE_FILE"
+    poll_mark_adopted notification
+    state_set notification.keys "$cur"
     log "adopted $(printf '%s\n' "$cur" | grep -c . || true) existing notifications"
-  else
-    new=$(printf '%s\n' "$cur" | grep -Fxv -f "$STATE_FILE" 2>/dev/null || true)
-    if [ -n "$new" ]; then
-      printf '%s\n' "$new" | while IFS= read -r key; do
-        [ -n "$key" ] && dispatch "$key"
-      done
-    fi
-    printf '%s\n' "$cur" >"$STATE_FILE"
+    return 0
   fi
 
-  sleep "$CHECK_INTERVAL"
-done
+  new=$(printf '%s\n' "$cur" | grep -Fxv -f "$(state_path notification.keys)" 2>/dev/null || true)
+  if [ -n "$new" ]; then
+    printf '%s\n' "$new" | while IFS= read -r key; do
+      [ -n "$key" ] && dispatch "$key"
+    done
+  fi
+  state_set notification.keys "$cur"
+}
+
+log "watching notifications (every ${CHECK_INTERVAL}s, packages: ${WATCH_PACKAGES:-all}, ignoring: ${IGNORE_PACKAGES:-none}, action: ${ACTION:+set})"
+poll_start step

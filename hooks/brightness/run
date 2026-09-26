@@ -11,6 +11,9 @@
 # Termux under runit, loops forever. Nothing runs until the dotfiles declare the
 # hook — home-manager calls `install-hook`, which is what creates the service.
 #
+# Logging, root, state, the action environment and the loop come from the shared
+# hook libs (lib/hook.sh's ev_run, lib/poll.sh).
+#
 # Env (defaults here; override via hookConfig in home-manager):
 #   CHECK_INTERVAL  seconds between polls                             (default 30)
 #   STEP            level change (0-255) that counts as an event      (default 15)
@@ -30,6 +33,11 @@
 # Actions run detached as root, like key-remap's gestures, so a slow command
 # cannot stall the poll loop.
 
+HOOK_LIB_DIR="${HOOK_LIB_DIR:-$HOME/.local/libexec/android-settings/lib}"
+. "$HOOK_LIB_DIR/hook.sh"
+. "$HOOK_LIB_DIR/poll.sh"
+hook_log_init brightness
+
 CHECK_INTERVAL=${CHECK_INTERVAL:-30}
 STEP=${STEP:-15}
 MIN_INTERVAL=${MIN_INTERVAL:-60}
@@ -38,58 +46,18 @@ MODE_ACTION=${MODE_ACTION:-}
 LEVEL_ACTION=${LEVEL_ACTION:-}
 NOTIFY=${NOTIFY:-0}
 
-STATE_DIR="$HOME/.local/state/aliyss-android-settings"
-STATE_FILE="$STATE_DIR/state/brightness"
-mkdir -p "$STATE_DIR/state"
-
-# Shared helper installed by `android-settings install-hook`.
-NOTIFY_LIB="$HOME/.local/libexec/android-settings/lib/notify.sh"
-[ -f "$NOTIFY_LIB" ] && . "$NOTIFY_LIB"
-
-# su resolution (KernelSU ships su in the Termux prefix here; Magisk on /system).
-SU_BIN=$(command -v su 2>/dev/null || printf /system/bin/su)
-
-log() { printf '[brightness] %s\n' "$(date +%H:%M:%S) $*"; }
-
-esc() { printf '%s' "$1" | sed "s/'/'\\\\''/g"; }
-
-as_root_out() { # $1 = command; prints its stdout
-  "$SU_BIN" -c "PATH=/system/bin:/system/xbin:\$PATH; export PATH; $1" 2>/dev/null
-}
-
-# Both settings in ONE root shell: spawning `su` is the expensive part of a
-# poll loop, and this runs every CHECK_INTERVAL. Sets cur_level / cur_mode
-# (either may be empty when the setting is unset). Values are handed back as
-# globals rather than as a joined string on purpose: `|` inside a ${x%%|*}
-# pattern is alternation under mksh, so the split silently returns nothing
-# there even though Termux's sh (dash) is fine with it.
+# Both settings in ONE root shell: spawning `su` is the expensive part of a poll
+# loop, and this runs every CHECK_INTERVAL. Sets cur_level / cur_mode (either may
+# be empty when the setting is unset). Values are handed back as globals rather
+# than as a joined string on purpose: `|` inside a ${x%%|*} pattern is
+# alternation under mksh, so the split silently returns nothing there even though
+# Termux's sh (dash) is fine with it.
 read_state() {
-  _out=$(as_root_out "settings get system screen_brightness; settings get system screen_brightness_mode")
-  cur_level=$(printf '%s\n' "$_out" | sed -n 1p | tr -d '[:space:]')
-  cur_mode=$(printf '%s\n' "$_out" | sed -n 2p | tr -d '[:space:]')
+  _bs_out=$(as_root_out "settings get system screen_brightness; settings get system screen_brightness_mode")
+  cur_level=$(printf '%s\n' "$_bs_out" | sed -n 1p | tr -d '[:space:]')
+  cur_mode=$(printf '%s\n' "$_bs_out" | sed -n 2p | tr -d '[:space:]')
   case "$cur_level" in null) cur_level='' ;; esac
   case "$cur_mode" in null) cur_mode='' ;; esac
-}
-
-# Observed values are handed to the action through the root shell's environment
-# (a plain export would not survive `su`, which may reset the environment).
-EV_ENV=''
-ev_set() { # $1 = name, $2 = value
-  EV_ENV="$EV_ENV$1='$(esc "$2")'; export $1; "
-}
-
-run_action() { # $1 = command (runs with $EV_ENV in scope)
-  [ -n "$1" ] || return 0
-  log "action: $1"
-  "$SU_BIN" -c "PATH=/system/bin:/system/xbin:\$PATH; export PATH; $EV_ENV$1" >/dev/null 2>&1 &
-}
-
-notify() { # $1 = title, $2 = body
-  if command -v android_notify >/dev/null 2>&1; then
-    android_notify "$1" "$2" brightness && return 0
-  fi
-  log "NOTIFICATION: $1 — $2"
-  return 1
 }
 
 percent() { # $1 = 0-255 level
@@ -97,77 +65,89 @@ percent() { # $1 = 0-255 level
 }
 
 emit() { # $1 = event, $2 = level, $3 = prev level, $4 = mode, $5 = prev mode
-  EV_ENV=''
-  ev_set EVENT "$1"
-  ev_set MODE "$4"
-  ev_set PREV_MODE "$5"
-  ev_set BRIGHTNESS "$2"
-  ev_set PREV_BRIGHTNESS "$3"
-  ev_set PERCENT "$(percent "$2")"
-  ev_set PREV_PERCENT "$(percent "$3")"
-
   case "$1" in
     mode)
       log "mode: ${5:-?} -> $4 (brightness ${2:-?}, $(percent "$2")%)"
-      run_action "$MODE_ACTION"
-      [ "$NOTIFY" = 1 ] && notify "Brightness mode" "$4 (was ${5:-?}), $(percent "$2")%"
+      _ev_cmd=$MODE_ACTION
+      _ev_title='Brightness mode'
+      _ev_body="$4 (was ${5:-?}), $(percent "$2")%"
       ;;
     level)
       log "level: ${3:-?} -> $2 ($(percent "$2")%, $4)"
-      run_action "$LEVEL_ACTION"
-      [ "$NOTIFY" = 1 ] && notify "Brightness" "$(percent "$2")% ($4)"
+      _ev_cmd=$LEVEL_ACTION
+      _ev_title='Brightness'
+      _ev_body="$(percent "$2")% ($4)"
       ;;
   esac
+
+  ev_run \
+    EVENT "$1" \
+    MODE "$4" PREV_MODE "$5" \
+    BRIGHTNESS "$2" PREV_BRIGHTNESS "$3" \
+    PERCENT "$(percent "$2")" PREV_PERCENT "$(percent "$3")" \
+    "$_ev_cmd"
+
+  [ "$NOTIFY" = 1 ] && hook_notify "$_ev_title" "$_ev_body" brightness
   return 0
 }
 
 # "<mode> <level>", split by `read` (no separator inside a pattern).
 prev_mode=''
 prev_level=''
-[ -f "$STATE_FILE" ] && read -r prev_mode prev_level <"$STATE_FILE"
+_last_level_event=0
 
-log "watching brightness (every ${CHECK_INTERVAL}s, step ${STEP}, level events in auto: ${LEVEL_IN_AUTO})"
-
-last_level_event=0
-
-while :; do
+step() {
   read_state
   level=$cur_level
-  rawmode=$cur_mode
-  case "$rawmode" in
+  case "$cur_mode" in
     1) mode=auto ;;
     *) mode=manual ;;
   esac
   now=$(date +%s)
 
-  if [ -z "$prev_mode" ] && [ -z "$prev_level" ]; then
+  if poll_is_first_run brightness; then
     # First ever run: adopt what is on screen instead of firing on boot.
+    poll_mark_adopted brightness
     prev_mode=$mode
     prev_level=$level
-    printf '%s %s' "$prev_mode" "$prev_level" >"$STATE_FILE"
+    state_set brightness "$prev_mode $prev_level"
     log "starting from mode=$prev_mode brightness=${prev_level:-?}"
-  elif [ "$mode" != "$prev_mode" ]; then
+    return 0
+  fi
+
+  if [ "$mode" != "$prev_mode" ]; then
     emit mode "$level" "$prev_level" "$mode" "$prev_mode"
     prev_mode=$mode
     prev_level=$level
-    last_level_event=$now
-    printf '%s %s' "$prev_mode" "$prev_level" >"$STATE_FILE"
-  elif [ -n "$level" ] && [ -n "$prev_level" ]; then
-    _diff=$(( level - prev_level ))
-    [ "$_diff" -lt 0 ] && _diff=$(( -_diff ))
-    if [ "$_diff" -ge "$STEP" ]; then
-      if [ "$mode" = auto ] && [ "$LEVEL_IN_AUTO" != 1 ]; then
-        # Track it silently so the next manual change is measured from here.
-        prev_level=$level
-        printf '%s %s' "$prev_mode" "$prev_level" >"$STATE_FILE"
-      elif [ $(( now - last_level_event )) -ge "$MIN_INTERVAL" ]; then
-        emit level "$level" "$prev_level" "$mode" "$prev_mode"
-        prev_level=$level
-        last_level_event=$now
-        printf '%s %s' "$prev_mode" "$prev_level" >"$STATE_FILE"
-      fi
-    fi
+    _last_level_event=$now
+    state_set brightness "$prev_mode $prev_level"
+    return 0
   fi
 
-  sleep "$CHECK_INTERVAL"
-done
+  [ -n "$level" ] && [ -n "$prev_level" ] || return 0
+  _bs_diff=$(( level - prev_level ))
+  [ "$_bs_diff" -lt 0 ] && _bs_diff=$(( -_bs_diff ))
+  [ "$_bs_diff" -ge "$STEP" ] || return 0
+
+  if [ "$mode" = auto ] && [ "$LEVEL_IN_AUTO" != 1 ]; then
+    # Track it silently so the next manual change is measured from here.
+    prev_level=$level
+    state_set brightness "$prev_mode $prev_level"
+    return 0
+  fi
+
+  [ $(( now - _last_level_event )) -ge "$MIN_INTERVAL" ] || return 0
+  emit level "$level" "$prev_level" "$mode" "$prev_mode"
+  prev_level=$level
+  _last_level_event=$now
+  state_set brightness "$prev_mode $prev_level"
+}
+
+# Resume from the last observed state across restarts. The adopt marker also
+# tells the first run apart from a restart with a stale state file.
+if [ -f "$(state_path brightness.adopted)" ]; then
+  read -r prev_mode prev_level <"$(state_path brightness)" 2>/dev/null || true
+fi
+
+log "watching brightness (every ${CHECK_INTERVAL}s, step ${STEP}, level events in auto: ${LEVEL_IN_AUTO})"
+poll_start step

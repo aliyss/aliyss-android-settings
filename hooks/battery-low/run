@@ -6,36 +6,32 @@
 # restarts it if it ever exits.
 #
 # Platform-native, no Termux:API: the level comes from `dumpsys battery` as root
-# and the notification from `cmd notification post` via the shared lib/notify.sh
-# helper (which posts as the shell uid — see the header of lib/notify.sh). If the
-# helper is missing — hook copied by hand — it degrades to a log line.
+# and the notification goes through the shared lib/notify.sh helper (which posts
+# as the shell uid — see the header of lib/notify.sh). If the helper is missing —
+# hook copied by hand — it degrades to a log line.
+#
+# Root, logging, state and the poll loop all come from the shared hook libs, so
+# this file is only the battery logic.
 #
 # Env (defaults here, override via hookConfig in home-manager):
 #   THRESHOLD       notify at/below this percentage   (default 15)
 #   REARM_AT        re-arm at/above this percentage   (default THRESHOLD+5)
 #   CHECK_INTERVAL  seconds between battery polls     (default 300)
 
+HOOK_LIB_DIR="${HOOK_LIB_DIR:-$HOME/.local/libexec/android-settings/lib}"
+. "$HOOK_LIB_DIR/hook.sh"
+. "$HOOK_LIB_DIR/poll.sh"
+hook_log_init battery-low
+
 THRESHOLD=${THRESHOLD:-15}
 CHECK_INTERVAL=${CHECK_INTERVAL:-300}
 REARM_AT=${REARM_AT:-$((THRESHOLD + 5))}
 
-STATE_DIR="$HOME/.local/state/aliyss-android-settings"
-STATE_FILE="$STATE_DIR/state/battery-low"
-mkdir -p "$STATE_DIR/state"
-
-# Shared helper installed by `android-settings install-hook`.
-NOTIFY_LIB="$HOME/.local/libexec/android-settings/lib/notify.sh"
-[ -f "$NOTIFY_LIB" ] && . "$NOTIFY_LIB"
-
-# su resolution (KernelSU ships su in the Termux prefix here; Magisk on /system).
-SU_BIN=$(command -v su 2>/dev/null || printf /system/bin/su)
-
-log() { printf '[battery-low] %s\n' "$(date +%H:%M:%S) $*"; }
-
 # dumpsys battery as root. Status is the platform enum:
 #   1 unknown, 2 charging, 3 discharging, 4 not charging, 5 full
+# Sets level / status for the caller.
 battery() {
-  dump=$("$SU_BIN" -c "PATH=/system/bin:\$PATH; export PATH; dumpsys battery" 2>/dev/null) || return 1
+  dump=$(as_root_out "dumpsys battery") || return 1
   level=$(
     printf '%s\n' "$dump" |
       sed -n 's/^ *level: *\([0-9][0-9]*\).*/\1/p' | head -n 1
@@ -53,45 +49,37 @@ battery() {
   [ -n "$level" ]
 }
 
-notify() { # $1 = title, $2 = body
-  if command -v android_notify >/dev/null 2>&1; then
-    android_notify "$1" "$2" battery-low && return 0
-  fi
-  log "NOTIFICATION: $1 — $2"
-  return 1
-}
-
-notified=0
-[ -f "$STATE_FILE" ] && notified=$(cat "$STATE_FILE" 2>/dev/null || printf 0)
+notified=$(state_get battery-low.notified)
 : "${notified:=0}"
 
-log "watching battery (notify <= ${THRESHOLD}%, re-arm >= ${REARM_AT}%) every ${CHECK_INTERVAL}s"
-
-while :; do
-  if battery; then
-    # Hysteresis: once fired, stay quiet until charging or REARM_AT.
-    if [ "$notified" -eq 1 ]; then
-      case "$status" in
-        CHARGING)
-          log "re-armed (status=$status)"
-          notified=0
-          ;;
-        *)
-          if [ "$level" -ge "$REARM_AT" ] 2>/dev/null; then
-            log "re-armed (level=$level >= $REARM_AT)"
-            notified=0
-          fi
-          ;;
-      esac
-    fi
-    if [ "$notified" -eq 0 ] && [ "$level" -le "$THRESHOLD" ] 2>/dev/null; then
-      notify "Battery low" "Battery at ${level}% (alert at ${THRESHOLD}%)"
-      log "notified at ${level}%"
-      notified=1
-    fi
-  else
+step() {
+  if ! battery; then
     log "dumpsys battery failed (su denied? no root?)"
+    return 0
   fi
-  printf '%s' "$notified" >"$STATE_FILE"
-  sleep "$CHECK_INTERVAL"
-done
+
+  # Hysteresis: once fired, stay quiet until charging or REARM_AT.
+  if [ "$notified" -eq 1 ]; then
+    case "$status" in
+      CHARGING)
+        log "re-armed (status=$status)"
+        notified=0
+        ;;
+      *)
+        if [ "$level" -ge "$REARM_AT" ] 2>/dev/null; then
+          log "re-armed (level=$level >= $REARM_AT)"
+          notified=0
+        fi
+        ;;
+    esac
+  fi
+  if [ "$notified" -eq 0 ] && [ "$level" -le "$THRESHOLD" ] 2>/dev/null; then
+    hook_notify "Battery low" "Battery at ${level}% (alert at ${THRESHOLD}%)" battery-low
+    log "notified at ${level}%"
+    notified=1
+  fi
+  state_set battery-low.notified "$notified"
+}
+
+log "watching battery (notify <= ${THRESHOLD}%, re-arm >= ${REARM_AT}%) every ${CHECK_INTERVAL}s"
+poll_start step

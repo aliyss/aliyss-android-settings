@@ -5,8 +5,9 @@
 # Termux boot (no `down` file). So the module's job is declarative glue that runs
 # on every switch:
 #
-#   1. render `props` to a manifest and `android-settings apply` it (safe to
-#      re-run: every line is written again);
+#   1. render `props` to a manifest and `android-settings apply` it (every line
+#      is written again — harmless; `verify` is what reads the keys back, and the
+#      props-watch hook can re-apply on drift without a switch);
 #   2. `android-settings sync-hooks` the declared `hooks` — install new/changed,
 #      remove undeclared, leave unchanged ones running, env from `hookConfig`.
 #
@@ -15,6 +16,9 @@
 #
 # The flake binds `self` so `package` defaults to this repo's own build:
 #   homeModules.default = import ./modules/home-manager.nix { inherit self; };
+#
+# The pure text rendering lives in ./render.nix, which flake.nix's `checks.render`
+# tests against golden files.
 { self }: {
   config,
   lib,
@@ -23,53 +27,13 @@
 }: let
   cfg = config.aliyss.androidSettings;
 
-  # `toString` is wrong for two of the types this module accepts:
-  #   - floats render as "1.000000", while Android stores whatever string it is
-  #     handed and `verify` compares that string literally — so they are written
-  #     the way the props files spell them ("0.75", "1.0"). JSON gives that and
-  #     shortens "0.750000" to "0.75";
-  #   - bools render as "" / "1", so `false` would write an empty value (and an
-  #     empty hook env var) instead of the `0` the props files and hooks use.
-  toStr = value:
-    if builtins.isBool value
-    then if value then "1" else "0"
-    else if builtins.isFloat value
-    then builtins.toJSON value
-    else toString value;
+  render = import ./render.nix {inherit lib;};
 
-  # A `props` entry is one manifest line. Most are `namespace.key = value`, but
-  # the engine's other line forms need help:
-  #   - a list value is comma-joined, which is the syntax `qs.add`/`qs.remove`
-  #     take (`qs.add = flashlight,screenrecord`);
-  #   - the key "cmd:" holds raw root commands, each rendered as its own
-  #     `cmd:...` line, for the toggles `settings put` cannot drive
-  #     (`svc wifi enable`, `svc data disable`, ...).
-  propLine = key: value:
-    if key == "cmd:"
-    then map (cmd: "cmd:${toStr cmd}") (lib.toList value)
-    else [
-      "${key} = ${
-        if builtins.isList value
-        then lib.concatMapStringsSep "," toStr value
-        else toStr value
-      }"
-    ];
+  manifest = pkgs.writeText "android-settings.props" (render.manifestText cfg.props);
 
-  manifest = pkgs.writeText "android-settings.props" (
-    lib.concatLines (lib.concatLists (lib.mapAttrsToList propLine cfg.props))
-  );
-
-  # One `<hook>.env` per hookConfig entry, in the store. Values are shell-quoted
-  # because the hook sources this file (`set -a; . env`), and a raw
-  # `ACTION=cmd with spaces` would run cmd at source time.
   hookEnvFiles = lib.mapAttrs (
-    name: env:
-      pkgs.writeText "android-settings-${name}.env" (
-        lib.concatLines (
-          lib.mapAttrsToList (key: value: "${key}=${lib.escapeShellArg (toStr value)}") env
-        )
-      )
-  ) cfg.hookConfig;
+    name: text: pkgs.writeText "android-settings-${name}.env" text
+  ) (render.hookEnvTexts cfg.hookConfig);
 
   hookEnvDir = pkgs.linkFarm "android-settings-hookenv" (
     lib.mapAttrsToList (name: path: {
@@ -78,7 +42,7 @@
     }) hookEnvFiles
   );
 
-  hookNames = lib.concatStringsSep " " cfg.hooks;
+  hookNames = render.hookNames cfg.hooks;
 in {
   options.aliyss.androidSettings = {
     enable = lib.mkEnableOption "declarative Android settings and hook services";
@@ -120,6 +84,8 @@ in {
         value is comma-joined, for `qs.add` / `qs.remove`. Raw root commands —
         for toggles `settings put` cannot drive, like `svc wifi enable` — go
         under the `"cmd:"` key, one manifest `cmd:` line each.
+
+        `android-settings lint` checks all of this offline, before a switch.
       '';
     };
 
@@ -149,6 +115,10 @@ in {
         shell-quoted when written, so an `ACTION` with spaces stays one word.
         Changing one reinstalls that hook, which restarts its service on the
         next switch.
+
+        Keys must be valid shell names (the file is sourced): a key like
+        `08:00` cannot be expressed — the `schedule` hook takes `HH:MM|command`
+        entries in a single `SCHEDULES` value instead.
       '';
     };
   };

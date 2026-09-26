@@ -1,0 +1,108 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# schedule — run commands at fixed times of day.
+#
+# night-dnd and night-dark each own one time-based behaviour because they need
+# state of their own. This is the generic case: a list of "run this at HH:MM"
+# entries declared in hookConfig, run as root, fired once per day per entry.
+#
+# Entries are separated by `;` and written `HH:MM|command`:
+#
+#   SCHEDULES="07:30|cmd uimode night no;22:00|cmd uimode night yes;23:30|settings put global low_power 1"
+#
+# A command containing `;` cannot be expressed (the separator is not escapable) —
+# put it in a small script and schedule that instead.
+#
+# Firing is grace-based rather than exact-minute: a tick records what it ran
+# (index + date in state/schedule.fired), so a missed minute (Doze, a restart, a
+# busy device) still fires while the clock is within GRACE minutes of the entry.
+# Nothing is replayed for an earlier day.
+#
+# Hook contract (aliyss-android-settings): sourced with env, executed natively in
+# Termux under runit, loops forever.
+#
+# Env (defaults here, override via hookConfig in home-manager):
+#   SCHEDULES       `HH:MM|command` entries, `;` separated      (default empty)
+#   CHECK_INTERVAL  seconds between checks                       (default 30)
+#   GRACE           minutes after HH:MM an entry may still fire  (default 2)
+#   NOTIFY          1 = notify when an entry fires               (default 0)
+#
+# Action environment: each command runs as root with EVENT=schedule, AT=HH:MM
+# available in its own shell (the command is the only thing run, so it is the
+# command's business whether it reads them).
+
+HOOK_LIB_DIR="${HOOK_LIB_DIR:-$HOME/.local/libexec/android-settings/lib}"
+. "$HOOK_LIB_DIR/hook.sh"
+. "$HOOK_LIB_DIR/poll.sh"
+hook_log_init schedule
+
+CHECK_INTERVAL=${CHECK_INTERVAL:-30}
+SCHEDULES=${SCHEDULES:-}
+GRACE=${GRACE:-2}
+NOTIFY=${NOTIFY:-0}
+
+[ -n "$SCHEDULES" ] || log "SCHEDULES is empty — nothing to run"
+
+# Today's fired markers, one per line: "<index> <HH:MM> <date>".
+fired_today() { # $1 = date
+  state_get schedule.fired 2>/dev/null | grep -F " $1" || true
+}
+
+record_fired() { # $1 = new marker line, $2 = date
+  _sf_keep=$(fired_today "$2")
+  state_set schedule.fired "${_sf_keep}${_sf_keep:+
+}$1"
+}
+
+step() {
+  _sc_today=$(date +%Y-%m-%d)
+  _sc_now=$(date +%H:%M)
+  _sc_now_min=$(time_minutes "$_sc_now")
+  [ -n "$_sc_now_min" ] || return 0
+
+  _sc_entries=$(printf '%s' "$SCHEDULES" | tr ';' '\n')
+  _sc_idx=0
+  for _sc_entry in $_sc_entries; do
+    _sc_idx=$((_sc_idx + 1))
+    _sc_when=$(trim_ws "${_sc_entry%%|*}")
+    _sc_cmd=$(trim_ws "${_sc_entry#*|}")
+    [ -n "$_sc_when" ] || continue
+
+    if [ "$_sc_cmd" = "$_sc_entry" ]; then
+      log "entry $_sc_idx has no '|' (want HH:MM|command): $_sc_entry"
+      continue
+    fi
+
+    _sc_when_min=$(time_minutes "$_sc_when")
+    if [ -z "$_sc_when_min" ]; then
+      log "entry $_sc_idx has a bad time (want zero-padded HH:MM): $_sc_when"
+      continue
+    fi
+
+    # Only forward: a tick before the entry does nothing, and one more than
+    # GRACE minutes late is history, not a missed run.
+    _sc_delta=$((_sc_now_min - _sc_when_min))
+    [ "$_sc_delta" -ge 0 ] || continue
+    [ "$_sc_delta" -le "$GRACE" ] || continue
+
+    _sc_marker="$_sc_idx $_sc_when $_sc_today"
+    if printf '%s\n' "$(fired_today "$_sc_today")" | grep -Fxq "$_sc_marker"; then
+      continue
+    fi
+
+    log "running $_sc_when: $_sc_cmd"
+    if as_root "EVENT=schedule; AT=$_sc_when; export EVENT AT; $_sc_cmd"; then
+      log "ran $_sc_when ok"
+    else
+      log "command failed: $_sc_cmd"
+    fi
+    [ "$NOTIFY" = 1 ] && hook_notify "Scheduled $_sc_when" "$_sc_cmd" schedule
+    record_fired "$_sc_marker" "$_sc_today"
+  done
+
+  # A new day should not keep yesterday's markers around.
+  _sc_keep=$(fired_today "$_sc_today")
+  state_set schedule.fired "$_sc_keep"
+}
+
+log "scheduling (every ${CHECK_INTERVAL}s, grace ${GRACE}min, $(printf '%s' "$SCHEDULES" | tr ';' '\n' | grep -c . || true) entry/entries)"
+poll_start step

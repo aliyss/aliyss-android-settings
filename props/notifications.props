@@ -1,0 +1,33 @@
+# notifications — heads-up banners, badge dots, bubbles, notification history, lock-screen content
+#
+# The props/ files are the *library*: everything is commented out, uncomment what
+# you want and apply the file by name (see display.props for the workflow).
+#
+# Do-Not-Disturb is not here — it lives in sound.props (`zen_mode` /
+# `cmd notification set_dnd`), because it is a ringer-adjacent mode rather than a
+# notification-display switch. Per-app notification ops are in apps.props.
+
+# --- Heads-up banners (the floating pop-up) ---
+# global.heads_up_notifications_enabled = 1
+
+# --- Launcher badge dots ---
+# secure.notification_badging = 1
+
+# --- Bubbles (Android 11+ conversations) ---
+# secure.notification_bubbles = 1
+
+# --- Notification history (Settings > Notifications > Notification history) ---
+# secure.notification_history_enabled = 1
+
+# --- Lock-screen content (the privacy half is in privacy.props too) ---
+# secure.lock_screen_show_notifications = 1
+# secure.lock_screen_allow_private_notifications = 1
+
+# --- Notification listeners (what the `notification` hook replaced for events) ---
+# cmd:cmd notification allow_listener com.example/.Listener    # Android 11+; ROM-dependent
+# cmd:cmd notification remove_listener com.example/.Listener
+
+# --- Live inspection as root (what the notification hook polls) ---
+# cmd:cmd notification list               # keys of every active notification
+# cmd:cmd notification get '0|com.example|1|null|10123'   # one record, with title/text
+# cmd:cmd notification set_dnd off        # off | priority | alarms | on

@@ -1,0 +1,117 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# props-watch — keep a manifest applied, not just applied once.
+#
+# The gap it closes: `props` are written during a home-manager switch, but a
+# reboot, a ROM reset or a manual trip through Settings can silently change a
+# key afterwards, and nothing notices until the next switch. This hook re-runs
+# the engine's own `verify` on an interval and re-applies the manifest when it
+# reports drift, so the enforced set stays enforced.
+#
+# It is a thin wrapper around the engine on purpose: `verify` is what decides
+# what "drifted" means (including the QS tile merge), so there is no second
+# implementation of the manifest format here. The engine is run as the Termux
+# user; it elevates by itself where it needs to.
+#
+# Hook contract (aliyss-android-settings): sourced with env, executed natively in
+# Termux under runit, loops forever.
+#
+# Env (defaults here, override via hookConfig in home-manager):
+#   MANIFEST        manifest name or path the engine resolves    (default default)
+#   CHECK_INTERVAL  seconds between checks                       (default 300)
+#   REAPPLY         1 = apply the manifest when drift is found   (default 1)
+#   NOTIFY          1 = notify on a clean -> drift transition    (default 1)
+#   ENGINE          engine binary (default: ~/.local/bin/android-settings, then PATH)
+#   QUIET          1 = only log, never notify                    (default 0)
+#
+# The first run adopts: drift found at boot is repaired silently and logged,
+# because that is the expected case after a reboot, not news.
+
+HOOK_LIB_DIR="${HOOK_LIB_DIR:-$HOME/.local/libexec/android-settings/lib}"
+. "$HOOK_LIB_DIR/hook.sh"
+. "$HOOK_LIB_DIR/poll.sh"
+hook_log_init props-watch
+
+MANIFEST=${MANIFEST:-default}
+CHECK_INTERVAL=${CHECK_INTERVAL:-300}
+REAPPLY=${REAPPLY:-1}
+NOTIFY=${NOTIFY:-1}
+QUIET=${QUIET:-0}
+
+ENGINE=${ENGINE:-}
+if [ -z "$ENGINE" ]; then
+  if [ -x "$HOME/.local/bin/android-settings" ]; then
+    ENGINE="$HOME/.local/bin/android-settings"
+  else
+    ENGINE=android-settings
+  fi
+fi
+
+command -v "$ENGINE" >/dev/null 2>&1 || [ -x "$ENGINE" ] || {
+  log "engine not found: $ENGINE (nothing to watch)"
+  poll_sleep 3600
+  exit 1
+}
+
+# The engine's verify: 0 = in sync, 1 = drift (or a line that could not be read).
+verify_ok() { "$ENGINE" verify "$MANIFEST" >/dev/null 2>&1; }
+
+last=$(state_get props-watch)
+
+step() {
+  if verify_ok; then
+    if [ "$last" = drift ]; then
+      log "$MANIFEST is back in sync"
+      [ "$NOTIFY" = 1 ] && [ "$QUIET" != 1 ] &&
+        hook_notify "Android settings in sync" "$MANIFEST matches the declared props"
+    fi
+    last=clean
+    state_set props-watch clean
+    return 0
+  fi
+
+  log "drift detected in $MANIFEST"
+
+  if [ "$REAPPLY" = 1 ]; then
+    # --only-changed: the keys that still match are left alone, so a repair does
+    # not rewrite the whole manifest (and does not churn the ones SystemUI
+    # listens to).
+    if "$ENGINE" apply --only-changed "$MANIFEST" >/dev/null 2>&1; then
+      if verify_ok; then
+        log "re-applied $MANIFEST (back in sync)"
+      else
+        log "re-applied $MANIFEST, but some lines still do not match"
+      fi
+    else
+      log "re-apply failed — run 'android-settings verify $MANIFEST' to see why"
+    fi
+  fi
+
+  if [ "$last" != drift ] && [ "$NOTIFY" = 1 ] && [ "$QUIET" != 1 ]; then
+    if [ "$REAPPLY" = 1 ]; then
+      hook_notify "Android settings repaired" "$MANIFEST had drifted and was re-applied"
+    else
+      hook_notify "Android settings drifted" "$MANIFEST no longer matches (REAPPLY=0, not repaired)"
+    fi
+  fi
+
+  last=drift
+  state_set props-watch drift
+}
+
+if poll_is_first_run props-watch; then
+  poll_mark_adopted props-watch
+  log "starting: checking $MANIFEST every ${CHECK_INTERVAL}s (reapply: $REAPPLY, engine: $ENGINE)"
+  # Adopt the CURRENT state rather than reporting it: on boot, drift is expected.
+  if ! verify_ok; then
+    log "first run: $MANIFEST already drifted (expected after a reboot)"
+    [ "$REAPPLY" = 1 ] && "$ENGINE" apply --only-changed "$MANIFEST" >/dev/null 2>&1 &&
+      log "first run: re-applied $MANIFEST"
+    state_set props-watch drift
+    last=drift
+  else
+    state_set props-watch clean
+    last=clean
+  fi
+fi
+
+poll_start step

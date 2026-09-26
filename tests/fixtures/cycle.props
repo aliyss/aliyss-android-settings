@@ -1,0 +1,2 @@
+# tests/fixtures/cycle.props — includes itself; lint must warn, not hang
+include cycle.props

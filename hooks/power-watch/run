@@ -1,0 +1,135 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# power-watch — dispatch charger plug / unplug / battery-full as events.
+#
+# battery-low covers the discharge side (notify at N%); this is the other half of
+# the charging story, and like it, it is an event SOURCE: the dotfiles decide
+# ("on AC -> keep the screen on", "full -> notify and stop the charge alarm").
+#
+# Everything comes from `dumpsys battery` as root, in one su spawn per poll:
+#   status   1 unknown, 2 charging, 3 discharging, 4 not charging, 5 full
+#   plugged  0 unplugged, 1 AC, 2 USB, 4 wireless
+#
+# Hook contract (aliyss-android-settings): sourced with env, executed natively in
+# Termux under runit, loops forever.
+#
+# Env (defaults here; override via hookConfig in home-manager):
+#   CHECK_INTERVAL  seconds between polls                          (default 60)
+#   PLUG_ACTION     shell command run as root on plug-in
+#   UNPLUG_ACTION   ... on unplug
+#   FULL_ACTION     ... when the battery reports full
+#   ACTION          shared fallback when the event-specific one is empty
+#   NOTIFY          1 = also post a built-in notification          (default 0)
+#   NOTIFY_FULL     1 = also notify when full (subset of NOTIFY)   (default 1)
+#
+# Action environment:
+#   EVENT=plugged|unplugged|full   PREV_EVENT=...
+#   PLUGGED / PREV_PLUGGED   (0|1|2|4)   PLUG_LABEL=ac|usb|wireless|none
+#   STATUS / PREV_STATUS     (1-5)       STATUS_LABEL=charging|discharging|...
+#   LEVEL (percent)
+#
+# The first run adopts the current state instead of firing on boot. Actions run
+# detached as root, so a slow command cannot stall the poll loop.
+
+HOOK_LIB_DIR="${HOOK_LIB_DIR:-$HOME/.local/libexec/android-settings/lib}"
+. "$HOOK_LIB_DIR/hook.sh"
+. "$HOOK_LIB_DIR/poll.sh"
+hook_log_init power-watch
+
+CHECK_INTERVAL=${CHECK_INTERVAL:-60}
+PLUG_ACTION=${PLUG_ACTION:-}
+UNPLUG_ACTION=${UNPLUG_ACTION:-}
+FULL_ACTION=${FULL_ACTION:-}
+ACTION=${ACTION:-}
+NOTIFY=${NOTIFY:-0}
+NOTIFY_FULL=${NOTIFY_FULL:-1}
+
+plug_label() { # $1 = plugged value
+  case "$1" in
+    1) printf 'ac' ;;
+    2) printf 'usb' ;;
+    4) printf 'wireless' ;;
+    *) printf 'none' ;;
+  esac
+}
+
+status_label() { # $1 = status value
+  case "$1" in
+    2) printf 'charging' ;;
+    3) printf 'discharging' ;;
+    4) printf 'not_charging' ;;
+    5) printf 'full' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+# Sets level / status / plugged.
+read_power() {
+  _pw_dump=$(as_root_out "dumpsys battery") || return 1
+  level=$(printf '%s\n' "$_pw_dump" | sed -n 's/^ *level: *\([0-9][0-9]*\).*/\1/p' | head -n 1)
+  status=$(printf '%s\n' "$_pw_dump" | sed -n 's/^ *status: *\([0-9][0-9]*\).*/\1/p' | head -n 1)
+  plugged=$(printf '%s\n' "$_pw_dump" | sed -n 's/^ *plugged: *\([0-9][0-9]*\).*/\1/p' | head -n 1)
+  [ -n "$status" ] && [ -n "$plugged" ]
+}
+
+emit() { # $1 = event, $2 = command, $3 = title, $4 = body, $5 = notify (0|1)
+  log "$1: $4"
+  ev_run \
+    EVENT "$1" PREV_EVENT "${prev_event}" \
+    PLUGGED "$plugged" PREV_PLUGGED "$prev_plugged" \
+    PLUG_LABEL "$(plug_label "$plugged")" PREV_PLUG_LABEL "$(plug_label "$prev_plugged")" \
+    STATUS "$status" PREV_STATUS "$prev_status" \
+    STATUS_LABEL "$(status_label "$status")" \
+    LEVEL "$level" \
+    "$2"
+  [ "$5" = 1 ] && hook_notify "$3" "$4" power-watch
+  return 0
+}
+
+prev_event=''
+prev_plugged=''
+prev_status=''
+[ -f "$(state_path power-watch.adopted)" ] && {
+  read -r prev_event prev_plugged prev_status <"$(state_path power-watch)" 2>/dev/null || true
+}
+
+step() {
+  if ! read_power; then
+    log "dumpsys battery failed (su denied? no root?)"
+    return 0
+  fi
+
+  if poll_is_first_run power-watch; then
+    poll_mark_adopted power-watch
+    prev_plugged=$plugged
+    prev_status=$status
+    prev_event=$(status_label "$status")
+    state_set power-watch "$prev_event $prev_plugged $prev_status"
+    log "starting from $(status_label "$status") ($(plug_label "$plugged"), ${level:-?}%)"
+    return 0
+  fi
+
+  if [ "$plugged" != "$prev_plugged" ]; then
+    if [ "$plugged" != 0 ]; then
+      emit plugged "${PLUG_ACTION:-$ACTION}" 'Power connected' \
+        "$(plug_label "$plugged"), ${level:-?}%" "$NOTIFY"
+    else
+      emit unplugged "${UNPLUG_ACTION:-$ACTION}" 'Power disconnected' \
+        "on battery, ${level:-?}%" "$NOTIFY"
+    fi
+    prev_plugged=$plugged
+    prev_event=$(status_label "$status")
+  elif [ "$status" = 5 ] && [ "$prev_status" != 5 ]; then
+    # Full is its own event: the charger is still in, but the useful moment is
+    # the transition into full. NOTIFY_FULL and NOTIFY both turn it on.
+    _pw_notify_full=$NOTIFY
+    [ "$NOTIFY_FULL" = 1 ] && _pw_notify_full=1
+    emit full "${FULL_ACTION:-$ACTION}" 'Battery full' "charged to ${level:-100}%" "$_pw_notify_full"
+    prev_event=full
+  fi
+
+  prev_status=$status
+  state_set power-watch "$prev_event $prev_plugged $prev_status"
+}
+
+log "watching power (every ${CHECK_INTERVAL}s, notify: $NOTIFY)"
+poll_start step

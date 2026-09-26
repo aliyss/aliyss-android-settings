@@ -1,0 +1,84 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# boot-hook — run an action once per device boot.
+#
+# Termux hooks autostart at boot (termux-services), but "started by runit" is not
+# the same as "the device just booted": a service restarted by hand, or after a
+# crash, must not re-run boot work. The boot session is identified by the kernel's
+# own id (/proc/sys/kernel/random/boot_id), which changes on every boot and never
+# changes within one — so the action runs exactly once per boot, however many
+# times the service is restarted.
+#
+# If that file is unreadable, the hook falls back to its first start since the
+# marker was written (which, for a runit-autostarted hook, is the boot itself)
+# and says so in the log.
+#
+# Hook contract (aliyss-android-settings): sourced with env, executed natively in
+# Termux under runit, loops forever.
+#
+# Env (defaults here, override via hookConfig in home-manager):
+#   BOOT_ACTION     shell command run as root once per boot
+#   DELAY           seconds to wait after the boot is noticed   (default 20)
+#                   — enough for the network and the storage to settle
+#   CHECK_INTERVAL  seconds between boot-id checks              (default 300)
+#   NOTIFY          1 = notify when the boot action ran          (default 0)
+#
+# Action environment: EVENT=boot, BOOT_ID, PREV_BOOT_ID.
+#
+# This does NOT re-apply props: that is props-watch's job (it verifies and repairs
+# on its own schedule). Keeping the two apart means one hook owns each concern.
+
+HOOK_LIB_DIR="${HOOK_LIB_DIR:-$HOME/.local/libexec/android-settings/lib}"
+. "$HOOK_LIB_DIR/hook.sh"
+. "$HOOK_LIB_DIR/poll.sh"
+hook_log_init boot-hook
+
+BOOT_ACTION=${BOOT_ACTION:-}
+DELAY=${DELAY:-20}
+CHECK_INTERVAL=${CHECK_INTERVAL:-300}
+NOTIFY=${NOTIFY:-0}
+
+BOOT_ID_FILE=${BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}
+
+read_boot_id() {
+  [ -r "$BOOT_ID_FILE" ] || return 0
+  tr -d '[:space:]' <"$BOOT_ID_FILE" 2>/dev/null
+}
+
+# Run the action, then wait before returning: DELAY exists so the command runs
+# against a settled system.
+fire_boot() { # $1 = boot id, $2 = previous boot id
+  [ -n "$BOOT_ACTION" ] || { log "boot $1 (no BOOT_ACTION configured)"; return 0; }
+  log "boot detected: $1 (was ${2:-none}), running action in ${DELAY}s"
+  sleep "$DELAY"
+  ev_run_sync EVENT boot BOOT_ID "$1" PREV_BOOT_ID "$2" "$BOOT_ACTION" ||
+    log "BOOT_ACTION failed"
+  [ "$NOTIFY" = 1 ] && hook_notify 'Boot action ran' \
+    "boot $(printf '%s' "$1" | cut -c1-8)" boot-hook
+  return 0
+}
+
+stored=$(state_get boot-hook.bid)
+
+step() {
+  bid=$(read_boot_id)
+
+  if [ -z "$bid" ]; then
+    # Unreadable: fall back to "first start after the marker was written".
+    poll_is_first_run boot-hook || return 0
+    poll_mark_adopted boot-hook
+    log "$BOOT_ID_FILE is unreadable — using first-start-of-the-service as the boot marker"
+    fire_boot unknown "$stored"
+    state_set boot-hook.bid unknown
+    stored=unknown
+    return 0
+  fi
+
+  [ "$bid" != "$stored" ] || return 0
+  poll_mark_adopted boot-hook
+  fire_boot "$bid" "$stored"
+  state_set boot-hook.bid "$bid"
+  stored=$bid
+}
+
+log "watching for boot ($BOOT_ID_FILE, every ${CHECK_INTERVAL}s, delay ${DELAY}s)"
+poll_start step

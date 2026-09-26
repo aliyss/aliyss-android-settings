@@ -1,0 +1,2 @@
+# tests/fixtures/clean-included.props — spliced by clean.props
+global.transition_animation_scale = 0.75

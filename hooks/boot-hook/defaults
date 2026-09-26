@@ -1,0 +1,7 @@
+# boot-hook defaults (sourced by the service run script; overridden by the
+# hookConfig env file written by home-manager). BOOT_ACTION is deliberately
+# empty: nothing happens until the dotfiles configure it.
+BOOT_ACTION=
+DELAY=20
+CHECK_INTERVAL=300
+NOTIFY=0

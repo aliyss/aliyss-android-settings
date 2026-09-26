@@ -1,0 +1,10 @@
+# power-watch defaults (sourced by the service run script; overridden by the
+# hookConfig env file written by home-manager). Actions are deliberately empty:
+# as an event source it does nothing until the dotfiles configure them.
+CHECK_INTERVAL=60
+PLUG_ACTION=
+UNPLUG_ACTION=
+FULL_ACTION=
+ACTION=
+NOTIFY=0
+NOTIFY_FULL=1

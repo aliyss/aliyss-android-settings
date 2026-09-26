@@ -1,0 +1,107 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# screen-state — watch the screen and dispatch on/off as events.
+#
+# An event SOURCE for the dotfiles, like brightness and notification: it publishes
+# what it sees and the dotfiles decide what happens ("screen off -> DND", "screen
+# on -> turn brightness back to auto"), so no policy lives here.
+#
+# Detection is `dumpsys power`'s wakefulness (Awake / Asleep / Dozing), with
+# `dumpsys display`'s mScreenState as the fallback for ROMs that phrase it
+# differently. Both greps run in ONE root shell — spawning su is the expensive
+# part of a 15s poll.
+#
+# Hook contract (aliyss-android-settings): sourced with env, executed natively in
+# Termux under runit, loops forever.
+#
+# Env (defaults here; override via hookConfig in home-manager):
+#   CHECK_INTERVAL     seconds between polls                       (default 15)
+#   SCREEN_ON_ACTION   shell command run as root when the screen wakes
+#   SCREEN_OFF_ACTION  ... when it goes dark
+#   ACTION             shared fallback when the event-specific one is empty
+#   NOTIFY             1 = also post a built-in notification        (default 0)
+#
+# Action environment:
+#   EVENT=screen_on|screen_off
+#   WAKE=Awake|Asleep|Dozing|unknown    PREV_WAKE=...
+#
+# The first run adopts the current state instead of firing on boot. Actions run
+# detached as root, so a slow command cannot stall the poll loop.
+
+HOOK_LIB_DIR="${HOOK_LIB_DIR:-$HOME/.local/libexec/android-settings/lib}"
+. "$HOOK_LIB_DIR/hook.sh"
+. "$HOOK_LIB_DIR/poll.sh"
+hook_log_init screen-state
+
+CHECK_INTERVAL=${CHECK_INTERVAL:-15}
+SCREEN_ON_ACTION=${SCREEN_ON_ACTION:-}
+SCREEN_OFF_ACTION=${SCREEN_OFF_ACTION:-}
+ACTION=${ACTION:-}
+NOTIFY=${NOTIFY:-0}
+
+# Sets wake (raw value) and screen (on|off|unknown).
+read_screen() {
+  _sc_out=$(as_root_out "dumpsys power | grep -m1 mWakefulness= ; dumpsys display | grep -m1 mScreenState=")
+  wake=$(printf '%s\n' "$_sc_out" | sed -n 's/.*mWakefulness=\([A-Za-z]*\).*/\1/p' | head -n 1)
+  case "$wake" in
+    Awake) screen=on ;;
+    Asleep | Dozing) screen=off ;;
+    *) screen='' ;;
+  esac
+  [ -n "$screen" ] && return 0
+  # Wakefulness missing (or phrased differently): fall back to the display state.
+  _sc_disp=$(printf '%s\n' "$_sc_out" | sed -n 's/.*mScreenState=\([A-Za-z]*\).*/\1/p' | head -n 1)
+  case "$_sc_disp" in
+    ON) screen=on ;;
+    OFF) screen=off ;;
+    *) screen=unknown ;;
+  esac
+}
+
+emit() { # $1 = screen (on|off), $2 = previous
+  case "$1" in
+    on)
+      _se_event=screen_on
+      _se_cmd=${SCREEN_ON_ACTION:-$ACTION}
+      _se_title='Screen on'
+      ;;
+    off)
+      _se_event=screen_off
+      _se_cmd=${SCREEN_OFF_ACTION:-$ACTION}
+      _se_title='Screen off'
+      ;;
+  esac
+  log "$_se_event (was $2, wake=${wake:-unknown})"
+  ev_run EVENT "$_se_event" WAKE "${wake:-unknown}" PREV_WAKE "${prev_wake:-unknown}" "$_se_cmd"
+  [ "$NOTIFY" = 1 ] && hook_notify "$_se_title" "wake=${wake:-unknown} (was ${prev_wake:-unknown})" screen-state
+  return 0
+}
+
+prev=''
+prev_wake=''
+[ -f "$(state_path screen-state.adopted)" ] && {
+  read -r prev prev_wake <"$(state_path screen-state)" 2>/dev/null || true
+}
+
+step() {
+  read_screen
+  [ "$screen" != unknown ] || return 0
+
+  if poll_is_first_run screen-state; then
+    poll_mark_adopted screen-state
+    prev=$screen
+    prev_wake=$wake
+    state_set screen-state "$prev $prev_wake"
+    log "starting from screen=$prev (wake=${wake:-unknown})"
+    return 0
+  fi
+
+  [ "$screen" != "$prev" ] || { prev_wake=$wake; return 0; }
+  _se_prev=$prev
+  prev=$screen
+  state_set screen-state "$prev $wake"
+  emit "$screen" "$_se_prev"
+  prev_wake=$wake
+}
+
+log "watching screen state (every ${CHECK_INTERVAL}s)"
+poll_start step

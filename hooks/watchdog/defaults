@@ -1,0 +1,8 @@
+# watchdog defaults (sourced by the service run script; overridden by the
+# hookConfig env file written by home-manager)
+CHECK_INTERVAL=60
+# Empty = every android-settings service. Names may omit the prefix:
+#   WATCH=battery-low,net-watch
+WATCH=
+RESTART=1
+NOTIFY=0

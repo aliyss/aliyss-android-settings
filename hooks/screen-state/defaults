@@ -1,0 +1,8 @@
+# screen-state defaults (sourced by the service run script; overridden by the
+# hookConfig env file written by home-manager). Actions are deliberately empty:
+# as an event source it does nothing until the dotfiles configure them.
+CHECK_INTERVAL=15
+SCREEN_ON_ACTION=
+SCREEN_OFF_ACTION=
+ACTION=
+NOTIFY=0

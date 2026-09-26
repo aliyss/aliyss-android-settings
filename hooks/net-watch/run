@@ -12,31 +12,22 @@
 # (`ip route get`), which also covers VPNs. `cmd wifi status` supplies the SSID,
 # and the alert goes through the shared lib/notify.sh helper.
 #
+# Logging, root, state, the poll loop and the "stable for N seconds" debounce all
+# come from the shared hook libs (see lib/poll.sh's poll_confirm).
+#
 # Env (defaults here, override via hookConfig in home-manager):
 #   CHECK_INTERVAL  seconds between checks                         (default 60)
 #   MIN_STABLE      seconds a new state must hold before notifying  (default 30)
 #   PROBE_TARGET    address used for the route lookup               (default 1.1.1.1)
 
+HOOK_LIB_DIR="${HOOK_LIB_DIR:-$HOME/.local/libexec/android-settings/lib}"
+. "$HOOK_LIB_DIR/hook.sh"
+. "$HOOK_LIB_DIR/poll.sh"
+hook_log_init net-watch
+
 CHECK_INTERVAL=${CHECK_INTERVAL:-60}
 MIN_STABLE=${MIN_STABLE:-30}
 PROBE_TARGET=${PROBE_TARGET:-1.1.1.1}
-
-STATE_DIR="$HOME/.local/state/aliyss-android-settings"
-STATE_FILE="$STATE_DIR/state/net-watch"
-mkdir -p "$STATE_DIR/state"
-
-# Shared helper installed by `android-settings install-hook`.
-NOTIFY_LIB="$HOME/.local/libexec/android-settings/lib/notify.sh"
-[ -f "$NOTIFY_LIB" ] && . "$NOTIFY_LIB"
-
-# su resolution (KernelSU ships su in the Termux prefix here; Magisk on /system).
-SU_BIN=$(command -v su 2>/dev/null || printf /system/bin/su)
-
-log() { printf '[net-watch] %s\n' "$(date +%H:%M:%S) $*"; }
-
-as_root_out() { # $1 = command; prints its stdout
-  "$SU_BIN" -c "PATH=/system/bin:/system/xbin:\$PATH; export PATH; $1" 2>/dev/null
-}
 
 # Interface a packet to PROBE_TARGET would use, e.g.
 #   1.1.1.1 via 10.128.119.213 dev rmnet_data4 table 1027 src 10.128.119.214 uid 0
@@ -90,14 +81,6 @@ describe() { # $1 = kind, $2 = iface -> notification body detail
   esac
 }
 
-notify() { # $1 = title, $2 = body
-  if command -v android_notify >/dev/null 2>&1; then
-    android_notify "$1" "$2" net-watch && return 0
-  fi
-  log "NOTIFICATION: $1 — $2"
-  return 1
-}
-
 notify_change() { # $1 = old kind, $2 = new kind, $3 = detail
   case "$2" in
     offline) _n_title='Network offline' ;;
@@ -107,46 +90,36 @@ notify_change() { # $1 = old kind, $2 = new kind, $3 = detail
     ethernet) _n_title='Ethernet connected' ;;
     *) _n_title="Network: $2" ;;
   esac
-  notify "$_n_title" "$3 (was $1)"
+  hook_notify "$_n_title" "$3 (was $1)" net-watch
 }
 
-last=''
-[ -f "$STATE_FILE" ] && last=$(cat "$STATE_FILE" 2>/dev/null)
-: "${last:=}"
-
-log "watching network (every ${CHECK_INTERVAL}s, stable for ${MIN_STABLE}s, probe ${PROBE_TARGET})"
-
-# A state only fires once it has held for MIN_STABLE seconds, so a quick
-# Wi-Fi/mobile flap never reaches the user.
-pending=''
-pending_since=0
-
-while :; do
+step() {
   iface=$(egress_iface)
   kind=$(kind_of "$iface")
-  now=$(date +%s)
 
-  if [ -z "$last" ]; then
-    # First ever run: adopt whatever is current instead of alerting on boot.
-    last=$kind
-    printf '%s' "$last" >"$STATE_FILE"
-    log "starting from state: $last"
-  elif [ "$kind" = "$last" ]; then
-    pending=''
-  else
-    if [ "$kind" != "$pending" ]; then
-      pending=$kind
-      pending_since=$now
-      log "state -> $kind (confirming for ${MIN_STABLE}s)"
-    fi
-    if [ "$((now - pending_since))" -ge "$MIN_STABLE" ]; then
-      notify_change "$last" "$kind" "$(describe "$kind" "$iface")"
-      log "notified: ${last} -> ${kind}"
-      last=$kind
-      printf '%s' "$last" >"$STATE_FILE"
-      pending=''
-    fi
+  # First ever run: adopt whatever is current instead of alerting on boot.
+  if poll_is_first_run net-watch; then
+    poll_mark_adopted net-watch
+    state_set net-watch "$kind"
+    log "starting from state: $kind"
+    return 0
   fi
 
-  sleep "$CHECK_INTERVAL"
-done
+  last=$(state_get net-watch)
+  if [ "$kind" = "$last" ]; then
+    poll_clear net-watch
+    return 0
+  fi
+
+  # A state only fires once it has held for MIN_STABLE seconds, so a quick
+  # Wi-Fi/mobile flap never reaches the user.
+  if poll_confirm net-watch "$kind" "$MIN_STABLE"; then
+    notify_change "$last" "$kind" "$(describe "$kind" "$iface")"
+    log "notified: ${last} -> ${kind}"
+    state_set net-watch "$kind"
+    poll_clear net-watch
+  fi
+}
+
+log "watching network (every ${CHECK_INTERVAL}s, stable for ${MIN_STABLE}s, probe ${PROBE_TARGET})"
+poll_start step

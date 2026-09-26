@@ -1,0 +1,27 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# su(1) stand-in for the test suite.
+#
+# Placed first on PATH, it has to satisfy the engine's root probe — `su -c 'id -u'`
+# must print 0, otherwise resolve_su (lib/su.sh) keeps looking and the whole
+# suite fails with "no root available". Above and below that probe it does not
+# elevate anything: it runs the command string with `sh -c`, so the real code
+# paths (the PATH pin, the quoting, the settings/dumpsys calls) execute without a
+# device and without root. The DB and the dumpsys output come from
+# tests/fake/settings and tests/fake/dumpsys.
+#
+# Anything other than `-c` is refused loudly: a test that silently ran as root
+# would be worse than a failing one.
+
+if [ "${1:-}" != "-c" ]; then
+  printf 'fake su: only `-c` is supported\n' >&2
+  exit 2
+fi
+shift
+
+# The probe, and only the probe, is answered as root.
+if [ "$*" = "id -u" ]; then
+  printf '0\n'
+  exit 0
+fi
+
+exec sh -c "$*"

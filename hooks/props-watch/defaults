@@ -1,0 +1,7 @@
+# props-watch defaults (sourced by the service run script; overridden by the
+# hookConfig env file written by home-manager)
+MANIFEST=default
+CHECK_INTERVAL=300
+REAPPLY=1
+NOTIFY=1
+QUIET=0

@@ -1,0 +1,8 @@
+# tests/fixtures/messy.props — one of every lint problem, for tests/run.sh
+qs.add = flashlight,nosuchtile
+cmd:echo lint-me
+global.wifi_on = 1
+badns.key = 1
+this is not a manifest line
+global.empty =
+include tests/fixtures/missing-manifest.props

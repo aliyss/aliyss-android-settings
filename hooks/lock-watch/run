@@ -1,0 +1,104 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# lock-watch — dispatch device lock / unlock as events.
+#
+# An event SOURCE for the dotfiles (same contract as brightness, screen-state and
+# notification): it publishes the lock state and the dotfiles decide what to do
+# with it, e.g. "locked -> cut the screen timeout", "unlocked -> re-apply props".
+#
+# Detection is the window manager's own keyguard flags, read as root in one
+# shell. ROMs disagree on which of these they print (and Android 15 renamed
+# some), so it greps several and takes any `true` as locked; when a ROM prints
+# none of them the hook reports `unknown` and does nothing rather than guessing.
+#
+# Hook contract (aliyss-android-settings): sourced with env, executed natively in
+# Termux under runit, loops forever.
+#
+# Env (defaults here; override via hookConfig in home-manager):
+#   CHECK_INTERVAL  seconds between polls                        (default 10)
+#   LOCK_ACTION     shell command run as root when the device locks
+#   UNLOCK_ACTION   ... when it unlocks
+#   ACTION          shared fallback when the event-specific one is empty
+#   NOTIFY          1 = also post a built-in notification        (default 0)
+#
+# Action environment:
+#   EVENT=locked|unlocked     PREV_EVENT=...
+#
+# The first run adopts the current state instead of firing on boot. Actions run
+# detached as root, so a slow command cannot stall the poll loop.
+
+HOOK_LIB_DIR="${HOOK_LIB_DIR:-$HOME/.local/libexec/android-settings/lib}"
+. "$HOOK_LIB_DIR/hook.sh"
+. "$HOOK_LIB_DIR/poll.sh"
+hook_log_init lock-watch
+
+CHECK_INTERVAL=${CHECK_INTERVAL:-10}
+LOCK_ACTION=${LOCK_ACTION:-}
+UNLOCK_ACTION=${UNLOCK_ACTION:-}
+ACTION=${ACTION:-}
+NOTIFY=${NOTIFY:-0}
+
+# Probe candidates, first match wins per flag. Kept to flags a ROM may print; an
+# absent flag is not treated as "false", it is simply not evidence.
+KEYGUARD_FLAGS="mDreamingLockscreen mShowingLockscreen mKeyguardShowing keyguardShowing"
+
+read_lock() {
+  _lw_out=$(as_root_out "dumpsys window | grep -m1 -e mDreamingLockscreen= -e mShowingLockscreen= -e mKeyguardShowing= ; dumpsys window policy | grep -m1 -e mKeyguardShowing -e mShowingLockscreen")
+  _lw_seen=""
+  _lw_state=unknown
+  for _lw_f in $KEYGUARD_FLAGS; do
+    _lw_v=$(printf '%s\n' "$_lw_out" |
+      sed -n "s/.*${_lw_f}[ =:]*\(true\|false\).*/\1/p" | head -n 1)
+    [ -n "$_lw_v" ] || continue
+    _lw_seen="$_lw_seen $_lw_f=$_lw_v"
+    if [ "$_lw_v" = true ]; then
+      _lw_state=locked
+      break
+    fi
+    _lw_state=unlocked
+  done
+  state=$_lw_state
+}
+
+emit() { # $1 = new state, $2 = previous
+  case "$1" in
+    locked)
+      _lw_event=locked
+      _lw_cmd=${LOCK_ACTION:-$ACTION}
+      _lw_title='Device locked'
+      ;;
+    unlocked)
+      _lw_event=unlocked
+      _lw_cmd=${UNLOCK_ACTION:-$ACTION}
+      _lw_title='Device unlocked'
+      ;;
+  esac
+  log "$_lw_event (was $2)$_lw_seen"
+  ev_run EVENT "$_lw_event" PREV_EVENT "$2" "$_lw_cmd"
+  [ "$NOTIFY" = 1 ] && hook_notify "$_lw_title" "keyguard ${_lw_event}" lock-watch
+  return 0
+}
+
+prev=''
+[ -f "$(state_path lock-watch.adopted)" ] && prev=$(state_get lock-watch)
+
+step() {
+  read_lock
+  [ "$state" != unknown ] || return 0
+
+  if poll_is_first_run lock-watch; then
+    poll_mark_adopted lock-watch
+    prev=$state
+    state_set lock-watch "$state"
+    log "starting from $state$_lw_seen"
+    return 0
+  fi
+
+  [ "$state" != "$prev" ] || return 0
+  _lw_prev=$prev
+  prev=$state
+  state_set lock-watch "$state"
+  emit "$state" "$_lw_prev"
+}
+
+log "watching lock state (every ${CHECK_INTERVAL}s)"
+poll_start step

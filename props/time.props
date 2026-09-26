@@ -1,0 +1,22 @@
+# time — 12/24-hour format, automatic time and time zone, NTP server, date format
+#
+# The props/ files are the *library*: everything is commented out, uncomment what
+# you want and apply the file by name (see display.props for the workflow).
+#
+# The clock format is worth having declaratively on a phone that gets restored
+# from a backup: the setting travels, but the ROM's default does not.
+
+# --- 12/24-hour clock (Settings > System > Date & time) ---
+# system.time_12_24 = 24                         # 12 | 24
+# system.date_format = dd-MM-yyyy                # read loosely; ROM/launcher dependent
+
+# --- Automatic time / time zone ---
+# global.auto_time = 1                           # 0 = set the clock by hand
+# global.auto_time_zone = 1                      # 0 = pick the zone by hand
+
+# --- NTP server used when auto_time is on ---
+# global.ntp_server = pool.ntp.org
+
+# --- The zone itself is a system property, not a settings row ---
+# cmd:setprop persist.sys.timezone Europe/Vienna   # root; survives a reboot
+# cmd:getprop persist.sys.timezone                 # read it back

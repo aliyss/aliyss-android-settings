@@ -1,0 +1,50 @@
+# CI for a repo whose product only ever runs on one phone: none of this touches a
+# device. The test suite fakes su/settings/dumpsys (see tests/run.sh), so the
+# same assertions run here, in `nix flake check`, and by hand.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # No nix required: on the runner /bin/sh is dash, which is also what Termux
+  # uses, so this job is the strictest POSIX check of the two.
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck (warning and above)
+        run: |
+          shellcheck --version
+          shellcheck --severity=warning -s sh \
+            bin/android-settings lib/*.sh $(ls hooks/*/run | grep -v key-remap)
+          shellcheck --severity=warning -s bash hooks/key-remap/run
+
+      - name: parse check with dash and bash
+        run: |
+          for f in bin/android-settings lib/*.sh $(ls hooks/*/run | grep -v key-remap); do
+            dash -n "$f"
+            bash -n "$f"
+          done
+          bash -n hooks/key-remap/run
+
+      - name: test suite
+        run: sh tests/run.sh
+
+  # The flake side: package, module rendering and the same checks, through nix.
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: nix flake check
+        run: nix flake check --print-build-logs

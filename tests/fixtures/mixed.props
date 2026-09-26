@@ -1,0 +1,4 @@
+# tests/fixtures/mixed.props — one line of every kind (setting, cmd:, qs.add)
+global.window_animation_scale = 0.75
+cmd:true
+qs.add = flashlight

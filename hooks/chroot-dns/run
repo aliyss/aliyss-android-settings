@@ -20,7 +20,8 @@
 # rather than silently costing you DNS again.
 #
 # Hook contract (aliyss-android-settings): sourced with env, executed natively
-# in Termux under runit, loops forever.
+# in Termux under runit, loops forever. Logging, state and the loop come from the
+# shared hook libs.
 #
 # Env (defaults here, override via hookConfig in home-manager):
 #   CHECK_INTERVAL  seconds between checks                          (default 300)
@@ -30,6 +31,11 @@
 #   LAUNCHER        chroot runner to guard (default ~/.nix/bin/nix-chroot-run)
 #   NOTIFY          1 = post a notification when the state changes  (default 1)
 
+HOOK_LIB_DIR="${HOOK_LIB_DIR:-$HOME/.local/libexec/android-settings/lib}"
+. "$HOOK_LIB_DIR/hook.sh"
+. "$HOOK_LIB_DIR/poll.sh"
+hook_log_init chroot-dns
+
 CHECK_INTERVAL=${CHECK_INTERVAL:-300}
 INET_GID=${INET_GID:-3003}
 TERMUX_UID=${TERMUX_UID:-10393}
@@ -37,24 +43,6 @@ TERMUX_GID=${TERMUX_GID:-$TERMUX_UID}
 LAUNCHER=${LAUNCHER:-$HOME/.nix/bin/nix-chroot-run}
 NOTIFY=${NOTIFY:-1}
 STORE=${STORE:-$HOME/.nix/nix}
-
-STATE_DIR="$HOME/.local/state/aliyss-android-settings"
-STATE_FILE="$STATE_DIR/state/chroot-dns"
-mkdir -p "$STATE_DIR/state"
-
-# Shared helper installed by `android-settings install-hook`.
-NOTIFY_LIB="$HOME/.local/libexec/android-settings/lib/notify.sh"
-[ -f "$NOTIFY_LIB" ] && . "$NOTIFY_LIB"
-
-log() { printf '[chroot-dns] %s\n' "$(date +%H:%M:%S) $*"; }
-
-notify() { # $1 = title, $2 = body
-  if command -v android_notify >/dev/null 2>&1; then
-    android_notify "$1" "$2" chroot-dns && return 0
-  fi
-  log "NOTIFICATION: $1 — $2"
-  return 1
-}
 
 # The setpriv the runner reaches for at run time. It has to be in the store the
 # chroot binds at /nix, because the runner resolves it by glob *inside* the
@@ -113,45 +101,43 @@ repair() {
   mv "$_r_new" "$LAUNCHER"
 }
 
-state=$(cat "$STATE_FILE" 2>/dev/null)
-: "${state:=}"
+state=$(state_get chroot-dns)
 
-log "guarding $LAUNCHER (every ${CHECK_INTERVAL}s, inet group ${INET_GID})"
-
-while :; do
+step() {
   now=$(health)
 
-  if [ "$now" != "$state" ]; then
-    case "$now" in
-      ok)
-        if [ -n "$state" ]; then
-          log "healthy: chroot runs with the inet group"
-          [ "$NOTIFY" = 1 ] && notify 'chroot DNS recovered' 'Name resolution works again for tools run through the Nix chroot'
-        else
-          log "healthy: runner carries the inet-group fix"
-        fi
-        ;;
-      unfixed)
-        if repair; then
-          log "repaired $LAUNCHER (inet group $INET_GID restored)"
-          [ "$NOTIFY" = 1 ] && notify 'chroot DNS repaired' 'The Nix chroot runner was dropping the inet group; name resolution is fixed'
-          now=$(health)
-        else
-          log "could not repair $LAUNCHER (unexpected format)"
-          [ "$NOTIFY" = 1 ] && notify 'chroot DNS at risk' 'The Nix chroot runner has an unexpected format; tools run in the chroot will fail to resolve names'
-        fi
-        ;;
-      no-setpriv)
-        log "fix present but no util-linux setpriv in $STORE/store — chroot DNS will fall back to setuidgid and break"
-        [ "$NOTIFY" = 1 ] && notify 'chroot DNS at risk' 'util-linux setpriv is missing from the Nix store; update the phone to restore it'
-        ;;
-      absent)
-        log "no chroot runner at $LAUNCHER — nothing to guard"
-        ;;
-    esac
-    state=$now
-    printf '%s' "$state" >"$STATE_FILE"
-  fi
+  [ "$now" != "$state" ] || return 0
 
-  sleep "$CHECK_INTERVAL"
-done
+  case "$now" in
+    ok)
+      if [ -n "$state" ]; then
+        log "healthy: chroot runs with the inet group"
+        [ "$NOTIFY" = 1 ] && hook_notify 'chroot DNS recovered' 'Name resolution works again for tools run through the Nix chroot'
+      else
+        log "healthy: runner carries the inet-group fix"
+      fi
+      ;;
+    unfixed)
+      if repair; then
+        log "repaired $LAUNCHER (inet group $INET_GID restored)"
+        [ "$NOTIFY" = 1 ] && hook_notify 'chroot DNS repaired' 'The Nix chroot runner was dropping the inet group; name resolution is fixed'
+        now=$(health)
+      else
+        log "could not repair $LAUNCHER (unexpected format)"
+        [ "$NOTIFY" = 1 ] && hook_notify 'chroot DNS at risk' 'The Nix chroot runner has an unexpected format; tools run in the chroot will fail to resolve names'
+      fi
+      ;;
+    no-setpriv)
+      log "fix present but no util-linux setpriv in $STORE/store — chroot DNS will fall back to setuidgid and break"
+      [ "$NOTIFY" = 1 ] && hook_notify 'chroot DNS at risk' 'util-linux setpriv is missing from the Nix store; update the phone to restore it'
+      ;;
+    absent)
+      log "no chroot runner at $LAUNCHER — nothing to guard"
+      ;;
+  esac
+  state=$now
+  state_set chroot-dns "$state"
+}
+
+log "guarding $LAUNCHER (every ${CHECK_INTERVAL}s, inet group ${INET_GID})"
+poll_start step

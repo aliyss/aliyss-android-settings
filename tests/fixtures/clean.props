@@ -1,0 +1,5 @@
+# tests/fixtures/clean.props — lint-clean, and exercises `include`
+global.window_animation_scale = 0.75
+system.screen_brightness = 128
+qs.add = flashlight
+include clean-included.props

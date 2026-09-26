@@ -1,0 +1,45 @@
+# accessibility — font scale, colour inversion, accessibility services, pointer size, mono audio
+#
+# The props/ files are the *library*: everything is commented out, uncomment what
+# you want and apply the file by name (see display.props for the workflow).
+#
+# Colour correction and colour inversion are also offered by display.props (they
+# are display features that happen to be accessibility ones); this file is the
+# place for the non-display knobs.
+
+# --- Font scale ---
+# system.font_scale = 1.0                        # float; the UI offers 0.85 - 1.3
+#   A stale font_scale is a classic cause of "settings UI looks wrong after a
+#   restore" — verify will catch the drift.
+
+# --- Accessibility services (master switch + the enabled list) ---
+# secure.accessibility_enabled = 1
+# secure.enabled_accessibility_services = com.example/.AccessibilityService
+#   colon-separated when there is more than one, e.g. "a/.A:b/.B"
+# cmd:settings get secure enabled_accessibility_services    # read it back
+
+# --- Colour inversion ---
+# secure.accessibility_display_inversion_enabled = 0
+
+# --- Touch and pointer ---
+# secure.accessibility_large_pointer_icon = 0
+# secure.touch_exploration_enabled = 0          # TalkBack's "explore by touch"
+# secure.high_text_contrast_enabled = 0
+#   Magnification has no single stable key across ROMs (the capability and mode
+#   keys differ): use Settings > Accessibility > Magnification instead.
+
+# --- System-wide mono audio ---
+# system.master_mono = 1
+
+# --- Live Caption (also listed in sound.props) ---
+# secure.odi_captions_enabled = 0
+
+# --- Autofill provider ---
+# secure.autofill_service = com.example/.AutofillService
+# secure.autofill_service = null                 # turn autofill off
+
+# --- Display size is an emulated density, not a setting ---
+# cmd:wm density 440
+# cmd:wm density reset
+# cmd:wm size 1080x2400
+# cmd:wm size reset

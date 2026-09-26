@@ -1,0 +1,9 @@
+# thermal-watch defaults (sourced by the service run script; overridden by the
+# hookConfig env file written by home-manager)
+CHECK_INTERVAL=120
+MAX_TEMP=42
+REARM_TEMP=40
+STATUS_ALERT=2
+HOT_ACTION=
+ACTION=
+NOTIFY=1

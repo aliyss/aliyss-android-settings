@@ -6,14 +6,17 @@
 # repo owns the engine, home-manager just calls it). It runs natively in a
 # Termux shell and inside the nix chroot (home-manager activation); anything
 # privileged goes through `su` (KernelSU) — or, where the chroot hides the real
-# su, through KernelSU's ksud CLI via a generated shim (see resolve_su) — so the
+# su, through KernelSU's ksud CLI via a generated shim (see lib/su.sh) — so the
 # process itself stays in the app's SELinux domain — runit can always supervise
 # the hooks.
 #
 # Usage:
-#   android-settings apply [--dry-run] [NAME|FILE...]
-#   android-settings verify [NAME|FILE...]
+#   android-settings apply [--dry-run] [--only-changed] [NAME|FILE...]
+#   android-settings verify [--json] [NAME|FILE...]
+#   android-settings lint [NAME|FILE...]         (offline; no root needed)
 #   android-settings list-props
+#   android-settings get NS KEY                  (settings get, as root)
+#   android-settings set NS KEY VALUE
 #   android-settings sync-hooks [--env-dir DIR] [--dry-run] NAME...
 #       Install/refresh exactly NAME... (each session's env read from
 #       <DIR>/<name>.env when given), remove hooks the previous run declared and
@@ -29,6 +32,12 @@
 #   android-settings list-disabled
 #   android-settings install-hook NAME [--env-file FILE]
 #   android-settings remove-hook NAME
+#   android-settings restart-hook NAME      (bounce a running service)
+#   android-settings reinstall-hooks [NAME...]   (re-copy from the package)
+#   android-settings test-hook NAME [SECONDS]    (foreground, one-off run)
+#   android-settings log NAME [-f]          (hook log; -f follows)
+#   android-settings logs                   (installed hook logs, with sizes)
+#   android-settings status                 (services + declared hooks)
 #   android-settings list-hooks
 #
 # A manifest argument is a path (anything with a slash or a .props suffix), a
@@ -41,6 +50,7 @@
 #   cmd:wm density 440                     # raw command, run as root
 #   qs.add = flashlight                    # ensure QS tiles are in the panel
 #   qs.remove = cast                       # ensure QS tiles are not in the panel
+#   include sound                          # splice props/sound.props in place
 set -eu
 
 # $PREFIX is a Termux-shell concept: inside the nix chroot (home-manager
@@ -62,131 +72,74 @@ else
   LIB_DIR="$ROOT/lib"
 fi
 
-# Shared helpers (notify.sh). Optional so the engine still works if only the
-# binary was copied out of the store.
-[ -f "$LIB_DIR/notify.sh" ] && . "$LIB_DIR/notify.sh"
-
 STATE_BASE="$HOME/.local/state/aliyss-android-settings"
 HOOKS_STATE="$STATE_BASE/hooks"
-LOG_BASE="$HOME/.local/state/aliyss-android-settings/logs"
+LOG_BASE="$STATE_BASE/logs"
 LIBEXEC_DIR="$HOME/.local/libexec/android-settings"
 SERVICE_BASE="$PREFIX/var/service/android-settings"
+
+# Shared helpers. su.sh reads AS_STATE_BASE for its shim / stderr file, so point
+# it at the engine's state dir before sourcing; both are optional so the engine
+# still works when only the binary was copied out of the store.
+export AS_STATE_BASE="$STATE_BASE"
+# shellcheck disable=SC1090,SC1091
+[ -f "$LIB_DIR/su.sh" ] && . "$LIB_DIR/su.sh"
+# shellcheck disable=SC1090,SC1091
+[ -f "$LIB_DIR/notify.sh" ] && . "$LIB_DIR/notify.sh"
 
 log() { printf '[android-settings] %s\n' "$*"; }
 warn() { printf '[android-settings] !! %s\n' "$*" >&2; }
 die() { warn "$*"; exit 1; }
 
-# Root is needed for settings get/put, cmd, pm — everything this engine does.
-# su is not in the activation script's PATH (KernelSU puts it on /system, not
-# in the Termux prefix), so resolve it from the standard locations.
-#
-# Two shapes of "no su" have to work:
-#
-#   native Termux — /system/bin/su (KernelSU/Magisk) or `su` on PATH elevates;
-#   the Nix chroot — the real su is hidden (/system/bin/su and /data/adb are not
-#     mounted) and $PREFIX/bin/su is the Termux stub that only prints "No su
-#     program found". Root there comes from KernelSU's ksud CLI: libksud.so is a
-#     plain file under $HOME and `debug su -g` runs a command in the global
-#     mount namespace — the same route the interactive fish su/sudo functions
-#     use.
-#
-# The ksud route is wrapped in a generated `su -c` shim so $SU_BIN keeps its
-# meaning for everything that uses it (lib/notify.sh sources this file and calls
-# "$SU_BIN" -c ... directly).
-SU_BIN=""
-KSUD_LIB="${KSUD_LIB:-$HOME/sukisu-mgr/lib/arm64-v8a/libksud.so}"
-KSUD_LINKER="${KSUD_LINKER:-/system/bin/linker64}"
-
-# A candidate is only good if it really elevates: inside the chroot the Termux
-# stub sits at the front of the search order and always fails.
-su_confirmed() { # $1 = candidate binary
-  _cand_out=$("$1" -c 'id -u' 2>/dev/null) || return 1
-  # `id -u` prints "0\n"; word-splitting trims it without needing tr/sed.
-  for _cand_w in $_cand_out; do
-    [ "$_cand_w" = 0 ] && return 0
-  done
-  return 1
-}
-
-# Generate (once) the `su -c` shim over libksud.so and print its path.
-write_ksud_shim() {
-  _shim="$STATE_BASE/su-ksud"
-  # Regenerate when missing, when the body changed (SHIM_REV — bump it with any
-  # edit below), or when it points at a different libksud (that path can move
-  # with a SukiSU update). NOTE: this heredoc is unquoted, so backticks and $
-  # must not appear in it — a stray pair would run a command here.
-  SHIM_REV=2
-  if [ ! -x "$_shim" ] || ! grep -q "shim-rev=$SHIM_REV" "$_shim" 2>/dev/null \
-    || ! grep -q "$KSUD_LIB" "$_shim" 2>/dev/null; then
-    mkdir -p "$STATE_BASE" 2>/dev/null || return 1
-    cat >"$_shim" <<EOF
-#!/data/data/com.termux/files/usr/bin/sh
-# Generated by android-settings — do not edit (shim-rev=$SHIM_REV).
-# su -c 'cmd' over KernelSU's ksud CLI, for hosts where the real su is not
-# reachable (inside the Nix chroot). Commands are read on stdin, -g selects the
-# global mount namespace, and the last command's exit status is propagated.
-# PATH has to hold the Android system dirs: ksud runs the command through a
-# shell it resolves on PATH, so a bare activation PATH (home-manager's own bin,
-# with no sh/id/pm) fails with "No such file or directory".
-PATH=/system/bin:/system/xbin:/vendor/bin
-export PATH
-[ "\${1:-}" = "-c" ] && shift
-printf '%s\\n' "\$*" | "$KSUD_LINKER" "$KSUD_LIB" debug su -g
-EOF
-    chmod 700 "$_shim" || return 1
-  fi
-  printf '%s' "$_shim"
-}
-
-resolve_su() {
-  [ -n "$SU_BIN" ] && return 0
-  for c in su /system/bin/su /system/xbin/su /sbin/su; do
-    _cand=$(command -v "$c" 2>/dev/null) || continue
-    [ -n "$_cand" ] || continue
-    if su_confirmed "$_cand"; then
-      SU_BIN=$_cand
-      return 0
-    fi
-  done
-  if [ -x "$KSUD_LINKER" ] && [ -f "$KSUD_LIB" ]; then
-    SU_BIN=$(write_ksud_shim) && [ -n "$SU_BIN" ] && return 0
-    SU_BIN=""
-  fi
-  return 1
-}
-need_root() {
-  resolve_su || die "no root available (need KernelSU/Magisk su, or libksud.so)"
-}
-as_root() {
-  resolve_su || return 1
-  # The root shell does NOT always get a useful PATH (seen during the
-  # home-manager switch: `settings: inaccessible or not found`), so pin the
-  # Android system dirs in front of whatever PATH it inherits.
-  # The dir must exist or the redirection below fails and every root call looks
-  # like a denial (nothing else creates it on a fresh device).
-  mkdir -p "$STATE_BASE" 2>/dev/null || true
-  _err="$STATE_BASE/su.err"
-  _i=0
-  while :; do
-    if "$SU_BIN" -c "PATH=/system/bin:/system/xbin:/vendor/bin:\$PATH; export PATH; $1" 2>"$_err"; then
-      return 0
-    fi
-    _i=$((_i + 1))
-    [ "$_i" -ge 3 ] && break
-    sleep 1
-  done
-  warn "su failed ($(head -c 200 "$_err" 2>/dev/null || true))"
-  return 1
-}
+# A missing lib/ is worth saying out loud once: without su.sh every root call
+# below silently becomes "command not found".
+if ! command -v resolve_su >/dev/null 2>&1; then
+  die "lib/su.sh not found next to the engine (looked in $LIB_DIR)"
+fi
 
 # Escape single quotes for the inner shell su -c spawns.
 esc() { printf '%s' "$1" | sed "s/'/'\\\\''/g"; }
 
 # ---------------------------------------------------------------- manifest
-# Parse + process a manifest. process_line() is set by the caller.
+# Resolve one manifest argument into a path (see the usage note above).
+resolve_manifest() {
+  case "$1" in
+    all)
+      for f in "$PROPS_DIR"/*.props; do
+        [ -f "$f" ] || continue
+        printf '%s\n' "$f"
+      done
+      ;;
+    */* | *.props) printf '%s\n' "$1" ;;
+    *) printf '%s\n' "$PROPS_DIR/$1.props" ;;
+  esac
+}
+
+# `include NAME` / `include=NAME` splices another manifest in place, which is
+# how default.props composes the library files. Recursion is refused rather than
+# guarded against with a depth limit: an include cycle is always a mistake.
+INCLUDE_STACK=""
+
+# Resolve one include target:
+#   NAME           a bare name is a library file     -> props/NAME.props
+#   dir/FILE.props a path is relative to the file that includes it, so a
+#                  manifest stays correct wherever it is invoked from
+#   /abs/path      used as given
+resolve_include() { # $1 = target as written, $2 = the including manifest
+  case "$1" in
+    /*) printf '%s\n' "$1" ;;
+    */* | *.props) printf '%s\n' "$(dirname "$2")/$1" ;;
+    *) printf '%s\n' "$PROPS_DIR/$1.props" ;;
+  esac
+}
+
 process_manifest() {
   file=$1
   [ -f "$file" ] || die "manifest not found: $file"
+  case ":$INCLUDE_STACK:" in
+    *":$file:"*) warn "include cycle, skipped: $file"; return 0 ;;
+  esac
+  INCLUDE_STACK="$INCLUDE_STACK:$file"
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       '' | '#'*) continue ;;
@@ -194,12 +147,78 @@ process_manifest() {
     # Trim leading whitespace.
     line=${line#"${line%%[![:space:]]*}"}
     case "$line" in '' | '#'*) continue ;; esac
+
+    case "$line" in
+      include\ * | include=*)
+        _inc=${line#include}
+        _inc=${_inc#=}
+        _inc=${_inc# }
+        # Trim trailing whitespace off the value.
+        _inc=${_inc%"${_inc##*[![:space:]]}"}
+        [ -n "$_inc" ] || { warn "empty include in $file"; continue; }
+        _inc_path=$(resolve_include "$_inc" "$file")
+        process_manifest "$_inc_path" || return 1
+        continue
+        ;;
+    esac
+
     process_line "$line" || return 1
   done <"$file"
 }
 
+# Split "key = value" into the globals LKEY / LVALUE (whitespace trimmed).
+split_kv() { # $1 = "key = value"
+  LKEY=${1%%=*}
+  LVALUE=${1#*=}
+  LKEY=${LKEY%"${LKEY##*[![:space:]]}"}
+  LVALUE=${LVALUE#"${LVALUE%%[![:space:]]*}"}
+}
+
 # --------------------------------------------------------------- apply/verify
 DRY_RUN=0
+ONLY_CHANGED=0
+JSON=0
+
+# verify --json accumulators. JSON is a report format, not a log format: when it
+# is on, the per-line log/warn calls are replaced by items so the output stays
+# parseable (home-manager's props-watch hook consumes it).
+JSON_ITEMS=""
+JSON_OK=0
+JSON_BAD=0
+JSON_UNVER=0
+
+json_esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+json_item() { # $1 = key, $2 = status, $3 = current, $4 = wanted
+  JSON_ITEMS="$JSON_ITEMS${JSON_ITEMS:+,}{\"key\":\"$(json_esc "$1")\",\"status\":\"$2\",\"current\":\"$(json_esc "$3")\",\"wanted\":\"$(json_esc "$4")\"}"
+}
+
+# `bad` counts drift only — the exit status has to mean "something does not match",
+# or a manifest with cmd: lines could never verify clean (and props-watch, which
+# re-applies on a non-zero verify, would rewrite the phone forever). Unverifiable
+# lines are counted separately and reported honestly.
+json_count() { # $1 = status
+  case "$1" in
+    drift) JSON_BAD=$((JSON_BAD + 1)) ;;
+    unverifiable) JSON_UNVER=$((JSON_UNVER + 1)) ;;
+    *) JSON_OK=$((JSON_OK + 1)) ;;
+  esac
+}
+
+# One result, in whichever format is active. The counts run in both modes so
+# the closing summary is the same number the JSON would have reported.
+report() { # $1 = key, $2 = status, $3 = current, $4 = wanted, $5 = human message
+  json_count "$2"
+  if [ "$JSON" = 1 ]; then
+    json_item "$1" "$2" "$3" "$4"
+    return 0
+  fi
+  case "$2" in
+    ok) log "$5" ;;
+    *) warn "$5" ;;
+  esac
+  return 0
+}
 
 settings_line() { # $1 = "ns.key", $2 = value, $3 = mode (put|check)
   ns=${1%%.*}
@@ -220,6 +239,17 @@ settings_line() { # $1 = "ns.key", $2 = value, $3 = mode (put|check)
       log "would set: $ns.$key = $2"
       return 0
     fi
+    # --only-changed reads first and skips the write when it already matches.
+    # That is an extra root call per key, but it keeps a no-op switch from
+    # re-writing everything (and, for the keys SystemUI watches, from churning).
+    if [ "$ONLY_CHANGED" = 1 ]; then
+      _oc_cur=$(as_root "settings get $ns '$(esc "$key")'" || true)
+      case "$_oc_cur" in null) _oc_cur='' ;; esac
+      if [ "$_oc_cur" = "$2" ]; then
+        log "unchanged: $ns.$key = $2"
+        return 0
+      fi
+    fi
     if as_root "settings put $ns '$(esc "$key")' '$(esc "$2")'"; then
       log "set: $ns.$key = $2"
       return 0
@@ -230,10 +260,11 @@ settings_line() { # $1 = "ns.key", $2 = value, $3 = mode (put|check)
 
   # check (verify mode)
   cur=$(as_root "settings get $ns '$(esc "$key")'" || true)
+  case "$cur" in null) cur='' ;; esac
   if [ "$cur" = "$2" ]; then
-    log "ok: $ns.$key = $2"
+    report "$1" ok "$cur" "$2" "ok: $ns.$key = $2"
   else
-    warn "diff: $ns.$key — current '${cur:-<unset>}' wanted '$2'"
+    report "$1" drift "$cur" "$2" "diff: $ns.$key — current '${cur:-<unset>}' wanted '$2'"
     return 1
   fi
 }
@@ -251,24 +282,24 @@ cmd_line() { # $1 = raw command, $2 = mode (put|check)
       return 1
     fi
   else
-    log "cmd (not verifiable): $1"
+    # A cmd: line has no readable state to compare, so verify reports it as
+    # unverifiable rather than pretending it passed.
+    report "cmd:$1" unverifiable "" "$1" "cmd (not verifiable): $1"
   fi
 }
 
 do_apply() {
   rc=0
   for m in "$@"; do
+    INCLUDE_STACK=""
     process_line() {
       case "$1" in
         cmd:*) cmd_line "${1#cmd:}" put ;;
         qs.*) qs_line "$1" put || rc=1 ;;
+        include\ * | include=*) : ;; # handled by process_manifest
         *)
-          nskey=${1%%=*}
-          value=${1#*=}
-          # Trim whitespace around key and value.
-          nskey=${nskey%"${nskey##*[![:space:]]}"}
-          value=${value#"${value%%[![:space:]]*}"}
-          settings_line "$nskey" "$value" put || rc=1
+          split_kv "$1"
+          settings_line "$LKEY" "$LVALUE" put || rc=1
           ;;
       esac
     }
@@ -280,22 +311,166 @@ do_apply() {
 do_verify() {
   rc=0
   for m in "$@"; do
+    INCLUDE_STACK=""
     process_line() {
       case "$1" in
         cmd:*) cmd_line "${1#cmd:}" check ;;
         qs.*) qs_line "$1" check || rc=1 ;;
+        include\ * | include=*) : ;;
         *)
-          nskey=${1%%=*}
-          value=${1#*=}
-          nskey=${nskey%"${nskey##*[![:space:]]}"}
-          value=${value#"${value%%[![:space:]]*}"}
-          settings_line "$nskey" "$value" check || rc=1
+          split_kv "$1"
+          settings_line "$LKEY" "$LVALUE" check || rc=1
           ;;
       esac
     }
     process_manifest "$m" || rc=1
   done
+
+  if [ "$JSON" = 1 ]; then
+    printf '{"ok":%s,"bad":%s,"unverifiable":%s,"items":[%s]}\n' \
+      "$JSON_OK" "$JSON_BAD" "$JSON_UNVER" "$JSON_ITEMS"
+  else
+    log "verify: ${JSON_OK} ok, ${JSON_BAD} not matching, ${JSON_UNVER} unverifiable"
+  fi
   return "$rc"
+}
+
+# ---------------------------------------------------------------- lint
+# Offline manifest check: no root, no device. Catches the mistakes that would
+# otherwise only show up as a warn line during a switch — a typo'd namespace, a
+# key that cannot be read back, a QS tile the ROM does not know.
+#
+# Warnings vs errors: an error means the line cannot work as written (bad
+# namespace, malformed key); a warning means it will run but probably not do what
+# the author meant (a read-only mirror, an unknown tile). Only errors set the
+# exit status, so lint stays usable in a pipeline that tolerates ROM quirks.
+
+# Tiles the AOSP/Quick-Settings surface defines (props/quicksettings.props).
+QS_KNOWN_TILES="internet cell wifi bt flashlight dnd alarm airplane rotation
+battery cast screenrecord hotspot nfc night dark saver location datasaver work
+inversion color_correction reduce_brightness sensors_off mic camera
+qr_code_scanner media_output record_issue hdr reading_mode vpn data_usage
+wallet"
+
+# Settings whose `global.*_on`-style key is a mirror the framework maintains:
+# writing it looks like it worked but the service state does not follow.
+MIRROR_KEYS="global.wifi_on global.bluetooth_on global.airplane_mode_on
+global.mobile_data global.wifi_scan_always_enabled secure.ui_night_mode
+secure.location_providers_allowed"
+
+lint_has() { # $1 = needle, $2... = list
+  _l_needle=$1
+  shift
+  for _l_c in "$@"; do
+    [ "$_l_c" = "$_l_needle" ] && return 0
+  done
+  return 1
+}
+
+LINT_ERRORS=0
+LINT_WARNINGS=0
+LINT_LINES=0
+
+lint_error() { LINT_ERRORS=$((LINT_ERRORS + 1)); warn "lint: $1"; }
+lint_warn() { LINT_WARNINGS=$((LINT_WARNINGS + 1)); warn "lint: warning: $1"; }
+
+lint_line() { # $1 = manifest line, $2 = file
+  LINT_LINES=$((LINT_LINES + 1))
+  case "$1" in
+    include\ * | include=*)
+      _l_inc=${1#include}
+      _l_inc=${_l_inc#=}
+      _l_inc=${_l_inc# }
+      _l_inc=${_l_inc%"${_l_inc##*[![:space:]]}"}
+      if [ -z "$_l_inc" ]; then
+        lint_error "$2: empty include"
+        return 0
+      fi
+      _l_path=$(resolve_include "$_l_inc" "$2")
+      [ -f "$_l_path" ] || lint_error "$2: include target not found: $_l_inc"
+      return 0
+      ;;
+    cmd:*)
+      # Legitimate, but the one line class that runs arbitrary root commands —
+      # worth naming in the report so a review sees it.
+      lint_warn "$2: root command (verify cannot check it): ${1#cmd:}"
+      return 0
+      ;;
+  esac
+
+  case "$1" in
+    qs.*)
+      split_kv "$1"
+      case "$LKEY" in
+        qs.add | qs.remove) : ;;
+        *)
+          lint_error "$2: bad qs op (want qs.add / qs.remove): $LKEY"
+          return 0
+          ;;
+      esac
+      [ -n "$LVALUE" ] || { lint_error "$2: no tiles given: $1"; return 0; }
+      # Split the tile list with tr, NOT by setting IFS=,: lint_has word-splits
+      # the known-tile list, and a comma IFS would collapse it into one word.
+      _l_tiles=$(printf '%s' "$LVALUE" | tr ',' '\n')
+      for _l_t in $_l_tiles; do
+        _l_t=$(printf '%s' "$_l_t" | tr -d '[:space:]')
+        [ -n "$_l_t" ] || continue
+        # shellcheck disable=SC2086
+        lint_has "$_l_t" $QS_KNOWN_TILES || lint_warn "$2: unknown QS tile (ROM-dependent): $_l_t"
+      done
+      return 0
+      ;;
+    *=*) : ;;
+    *)
+      lint_error "$2: not a manifest line (want 'ns.key = value'): $1"
+      return 0
+      ;;
+  esac
+
+  split_kv "$1"
+  _l_ns=${LKEY%%.*}
+  _l_key=${LKEY#*.}
+  case "$_l_ns" in
+    global | system | secure) : ;;
+    *) lint_error "$2: bad namespace: $LKEY (global|system|secure)"; return 0 ;;
+  esac
+  case "$_l_key" in
+    '' | *'.'*) lint_error "$2: bad key: $LKEY"; return 0 ;;
+  esac
+  case "$_l_key" in
+    *[!a-zA-Z0-9_]*)
+      lint_warn "$2: key has characters Android does not use: $_l_key"
+      ;;
+  esac
+  [ -n "$LVALUE" ] || lint_warn "$2: empty value: $LKEY"
+  # shellcheck disable=SC2086
+  lint_has "$LKEY" $MIRROR_KEYS &&
+    lint_warn "$2: $LKEY is a read-only mirror — writing it may not take effect"
+  return 0
+}
+
+do_lint() {
+  for m in "$@"; do
+    [ -f "$m" ] || { lint_error "manifest not found: $m"; continue; }
+    INCLUDE_STACK=""
+    # Includes are checked for existence, not spliced: each manifest is linted on
+    # its own so a problem is reported in the file that actually has it (`lint
+    # all` covers the whole library anyway).
+    _lint_file=$m
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in '' | '#'*) continue ;; esac
+      line=${line#"${line%%[![:space:]]*}"}
+      case "$line" in '' | '#'*) continue ;; esac
+      lint_line "$line" "$_lint_file"
+    done <"$_lint_file"
+  done
+
+  if [ "$LINT_ERRORS" -gt 0 ]; then
+    warn "lint: ${LINT_ERRORS} error(s), ${LINT_WARNINGS} warning(s) in ${LINT_LINES} line(s)"
+    return 1
+  fi
+  log "lint: clean (${LINT_LINES} lines, ${LINT_WARNINGS} warning(s))"
+  return 0
 }
 
 # ------------------------------------------------------------------- hooks
@@ -312,6 +487,17 @@ svc_cmd() { # $1... = sv args
   SV="$PREFIX/bin/sv"
   command -v sv >/dev/null 2>&1 && SV=$(command -v sv)
   SVDIR="$PREFIX/var/service" "$SV" "$@" >/dev/null 2>&1 || true
+}
+
+# Shared helpers live next to the hooks: a runit-spawned hook runs natively in
+# Termux, where the nix store is invisible, so it cannot use this engine.
+copy_hook_libs() {
+  mkdir -p "$LIBEXEC_DIR/lib"
+  for _cl in su.sh hook.sh poll.sh notify.sh; do
+    [ -f "$LIB_DIR/$_cl" ] || continue
+    cp -f "$LIB_DIR/$_cl" "$LIBEXEC_DIR/lib/$_cl"
+    chmod 644 "$LIBEXEC_DIR/lib/$_cl"
+  done
 }
 
 install_hook() { # $1 = name, $2 = env file ("" = none)
@@ -340,13 +526,7 @@ install_hook() { # $1 = name, $2 = env file ("" = none)
     rm -f "$hook_real/env"
   fi
 
-  # Shared helpers live next to the hooks: a runit-spawned hook runs natively
-  # in Termux, where the nix store is invisible, so it cannot use this engine.
-  if [ -f "$LIB_DIR/notify.sh" ]; then
-    mkdir -p "$LIBEXEC_DIR/lib"
-    cp -f "$LIB_DIR/notify.sh" "$LIBEXEC_DIR/lib/notify.sh"
-    chmod 644 "$LIBEXEC_DIR/lib/notify.sh"
-  fi
+  copy_hook_libs
 
   mkdir -p "$service"
   cat >"$service/run" <<EOF
@@ -354,6 +534,10 @@ install_hook() { # $1 = name, $2 = env file ("" = none)
 # android-settings hook service: $name
 # Managed by home-manager (aliyss.androidSettings) — do not edit by hand.
 HOOK_DIR="\$HOME/.local/libexec/android-settings/hooks/$name"
+# The hooks source the shared libs from here (a store path is invisible to a
+# native Termux process, so install-hook keeps a real copy).
+HOOK_LIB_DIR="\$HOME/.local/libexec/android-settings/lib"
+export HOOK_LIB_DIR
 # set -a: sourced vars must be EXPORTED — the hook is started with `exec`,
 # which starts a fresh process that only inherits exported variables.
 set -a
@@ -424,6 +608,14 @@ in_list() { # $1 = needle, $2... = haystack
     fi
   done
   return 1
+}
+
+# Names this engine knows about and has installed, one per line.
+installed_hooks() {
+  for d in "$LIBEXEC_DIR"/hooks/*/; do
+    [ -d "$d" ] || continue
+    basename "$d"
+  done
 }
 
 sync_hooks() { # [--env-dir DIR] [--dry-run] NAME...
@@ -513,6 +705,152 @@ sync_hooks() { # [--env-dir DIR] [--dry-run] NAME...
   return "$rc"
 }
 
+# Bounce one service without touching its files. `restart` needs supervise/ to
+# exist (i.e. runsv running) — otherwise there is nothing to restart.
+restart_hook() { # $1 = name
+  name=$1
+  valid_hook_name "$name" || die "invalid hook name: '$name'"
+  service="$(hook_service_dir "$name")"
+  [ -d "$service/supervise" ] || die "hook not running: $name (install it first)"
+  svc_cmd restart "android-settings-$name"
+  log "restarted: $name"
+}
+
+# Re-copy installed hooks from the package (keeping each hook's own env file) and
+# bounce them. This is the "I edited the hook and want it live now" path that
+# otherwise means waiting for the next switch.
+reinstall_hooks() { # $1... = names (default: every installed hook)
+  names="$*"
+  if [ -z "$names" ]; then
+    names=$(installed_hooks)
+  fi
+  [ -n "$names" ] || { log "no hooks installed"; return 0; }
+  need_root
+  rc=0
+  for name in $names; do
+    if ! valid_hook_name "$name" || [ ! -x "$HOOKS_DIR/$name/run" ]; then
+      warn "no such hook in this package: $name (skipped)"
+      rc=1
+      continue
+    fi
+    env_file=""
+    [ -f "$LIBEXEC_DIR/hooks/$name/env" ] && env_file="$LIBEXEC_DIR/hooks/$name/env"
+    install_hook "$name" "$env_file" || rc=1
+  done
+  return "$rc"
+}
+
+# Run a hook once, in the foreground, with its real env — the authoring loop
+# that otherwise means editing, installing, switching, then reading a log.
+# SECONDS=0 means "no timeout" (the hook loops until interrupted).
+test_hook() { # $1 = name, $2 = seconds (default 5)
+  name=$1
+  secs=${2:-5}
+  valid_hook_name "$name" || die "invalid hook name: '$name'"
+  [ -x "$HOOKS_DIR/$name/run" ] || die "no such hook: $name"
+  # The installed copy carries the hookConfig env; the package copy carries the
+  # defaults. Prefer the installed one for each file so a test matches the
+  # service as closely as possible.
+  defaults="$HOOKS_DIR/$name/defaults"
+  [ -f "$LIBEXEC_DIR/hooks/$name/defaults" ] && defaults="$LIBEXEC_DIR/hooks/$name/defaults"
+  env_file="$LIBEXEC_DIR/hooks/$name/env"
+
+  log "testing hook: $name (timeout: ${secs}s, env: ${env_file:-package defaults})"
+  (
+    cd "$HOOKS_DIR/$name" || exit 1
+    HOOK_LIB_DIR="$LIB_DIR"
+    export HOOK_LIB_DIR
+    set -a
+    # shellcheck disable=SC1090
+    [ -f "$defaults" ] && . "$defaults"
+    # shellcheck disable=SC1090
+    [ -n "$env_file" ] && [ -f "$env_file" ] && . "$env_file"
+    set +a
+    if [ "$secs" = 0 ]; then
+      exec ./run
+    fi
+    if command -v timeout >/dev/null 2>&1; then
+      exec timeout "$secs" ./run
+    fi
+    # No timeout(1) (a stripped Termux): run it in the background and reap it.
+    ./run &
+    _th_pid=$!
+    sleep "$secs"
+    kill "$_th_pid" 2>/dev/null || true
+    wait "$_th_pid" 2>/dev/null || true
+  )
+}
+
+log_path() { printf '%s/%s.log' "$LOG_BASE" "$1"; }
+
+# Tail one hook log; `-f` follows it (what `journalctl -f` would be here).
+show_log() { # $1 = name, $2 = follow (0|1), $3 = lines
+  name=$1
+  lines=${3:-50}
+  file=$(log_path "$name")
+  if [ ! -f "$file" ]; then
+    warn "no log for hook '$name' at $file"
+    return 1
+  fi
+  if [ "${2:-0}" = 1 ]; then
+    tail -n "$lines" -f "$file"
+  else
+    tail -n "$lines" "$file"
+  fi
+}
+
+# Every installed hook's log, newest last, with size and mtime — enough to see
+# which service is chattering and which has gone quiet.
+list_logs() {
+  found=0
+  for name in $(installed_hooks); do
+    file=$(log_path "$name")
+    [ -f "$file" ] || continue
+    found=1
+    _l_size=$(wc -c <"$file" 2>/dev/null | tr -d '[:space:]')
+    _l_when=$(date -r "$file" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '?')
+    printf '%-18s %8s bytes  last write %s\n' "$name" "${_l_size:-0}" "$_l_when"
+  done
+  if [ "$found" = 0 ]; then
+    log "no hook logs yet in $LOG_BASE"
+    return 1
+  fi
+}
+
+sv_status_of() { # $1 = name
+  SV="$PREFIX/bin/sv"
+  command -v sv >/dev/null 2>&1 && SV=$(command -v sv)
+  SVDIR="$PREFIX/var/service" "$SV" status "android-settings-$1" 2>/dev/null || true
+}
+
+# One screen of "what is actually running": the declared hook ledger plus each
+# installed service's runit status and last log line.
+do_status() {
+  declared=""
+  [ -f "$HOOKS_STATE" ] && declared=$(tr '\n' ' ' <"$HOOKS_STATE" 2>/dev/null)
+  log "declared hooks: ${declared:-none ($HOOKS_STATE)}"
+
+  found=0
+  for name in $(installed_hooks); do
+    found=1
+    _st=$(sv_status_of "$name")
+    if [ -z "$_st" ]; then
+      printf '%-18s installed, not supervised\n' "$name"
+    else
+      printf '%-18s %s\n' "$name" "$_st"
+    fi
+    _last=$(tail -n 1 "$(log_path "$name")" 2>/dev/null || true)
+    [ -n "$_last" ] && printf '%-18s   %s\n' "" "$_last"
+  done
+  if [ "$found" = 0 ]; then
+    log "no hooks installed (declare them in the dotfiles, or install-hook)"
+    return 0
+  fi
+  root_state="unavailable"
+  resolve_su >/dev/null 2>&1 && root_state="$SU_BIN"
+  printf '%-18s %s\n' "root" "$root_state"
+}
+
 # ------------------------------------------------------- quick settings tiles
 # Settings.Secure.sysui_qs_tiles is the whole QS panel as ONE comma-separated
 # list, so "add a tile" is a merge, not an overwrite: read the list, patch it,
@@ -579,11 +917,11 @@ qs_edit() { # $1 = mode (put|check), $2 = add|remove, $3 = csv of tiles
     fi
     if qs_has "$_q_t" "$_q_cur"; then
       if [ "$_q_op" = add ]; then
-        if [ "$_q_mode" = check ]; then log "ok: qs tile present: $_q_t"; fi
+        if [ "$_q_mode" = check ]; then report "qs.$_q_op $_q_t" ok "$_q_t" "$_q_t" "ok: qs tile present: $_q_t"; fi
       else
         _q_out=$(qs_without "$_q_t" "$_q_out")
         if [ "$_q_mode" = check ]; then
-          warn "diff: qs tile should be absent: $_q_t"
+          report "qs.$_q_op $_q_t" drift "$_q_t" "" "diff: qs tile should be absent: $_q_t"
           _q_rc=1
         fi
       fi
@@ -591,11 +929,11 @@ qs_edit() { # $1 = mode (put|check), $2 = add|remove, $3 = csv of tiles
       if [ "$_q_op" = add ]; then
         _q_out="${_q_out:+$_q_out,}$_q_t"
         if [ "$_q_mode" = check ]; then
-          warn "diff: qs tile missing: $_q_t"
+          report "qs.$_q_op $_q_t" drift "" "$_q_t" "diff: qs tile missing: $_q_t"
           _q_rc=1
         fi
       else
-        if [ "$_q_mode" = check ]; then log "ok: qs tile absent: $_q_t"; fi
+        if [ "$_q_mode" = check ]; then report "qs.$_q_op $_q_t" ok "" "" "ok: qs tile absent: $_q_t"; fi
       fi
     fi
   done
@@ -626,20 +964,16 @@ qs_line() {
       return 1
       ;;
   esac
-  _l_key=${1%%=*}
-  _l_val=${1#*=}
-  # Trim trailing whitespace off the key, leading whitespace off the value.
-  _l_key=${_l_key%"${_l_key##*[![:space:]]}"}
-  _l_val=${_l_val#"${_l_val%%[![:space:]]*}"}
-  case "$_l_key" in
+  split_kv "$1"
+  case "$LKEY" in
     qs.add | qs.remove) : ;;
     *)
-      warn "bad qs op (want qs.add / qs.remove): $_l_key"
+      warn "bad qs op (want qs.add / qs.remove): $LKEY"
       return 1
       ;;
   esac
-  [ -n "$_l_val" ] || { warn "no tiles given: $1"; return 1; }
-  qs_edit "$2" "${_l_key#qs.}" "$_l_val"
+  [ -n "$LVALUE" ] || { warn "no tiles given: $1"; return 1; }
+  qs_edit "$2" "${LKEY#qs.}" "$LVALUE"
 }
 
 # ------------------------------------------------------------------- apps
@@ -692,6 +1026,33 @@ list_disabled() {
   as_root "pm list packages -d" | sed 's/^package://' || true
 }
 
+# ------------------------------------------------------------- settings access
+valid_ns() {
+  case "$1" in
+    global | system | secure) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# A one-off read/write without a manifest in the way: `settings get secure X`
+# needs root and a namespace the engine validates, and that is the whole point.
+settings_get() { # $1 = ns, $2 = key
+  valid_ns "$1" || die "bad namespace: $1 (global|system|secure)"
+  [ -n "$2" ] || die "settings get needs a key"
+  need_root
+  _g_out=$(as_root "settings get $1 '$(esc "$2")'") || die "settings get failed: $1.$2"
+  printf '%s\n' "$_g_out"
+}
+
+settings_set() { # $1 = ns, $2 = key, $3 = value
+  valid_ns "$1" || die "bad namespace: $1 (global|system|secure)"
+  [ -n "$2" ] || die "settings set needs a key"
+  [ $# -ge 3 ] || die "settings set needs a value"
+  need_root
+  as_root "settings put $1 '$(esc "$2")' '$(esc "$3")'" || die "settings put failed: $1.$2"
+  log "set: $1.$2 = $3"
+}
+
 list_props() {
   for f in "$PROPS_DIR"/*.props; do
     [ -f "$f" ] || continue
@@ -706,9 +1067,8 @@ list_hooks() {
   for d in "$HOOKS_DIR"/*/; do
     [ -d "$d" ] || continue
     name=$(basename "$d")
-    if [ -x "$(hook_service_dir "$name")/run" ]; then
-      st=$(SVDIR="$PREFIX/var/service" sv status "android-settings-$name" 2>/dev/null |
-        cut -d: -f1 || true)
+    if hook_installed "$name"; then
+      st=$(sv_status_of "$name" | cut -d: -f1 || true)
       [ -n "$st" ] || st=installed
       printf '%-16s installed (%s)\n' "$name" "$st"
     else
@@ -718,33 +1078,30 @@ list_hooks() {
 }
 
 # -------------------------------------------------------------------- main
-[ "${1:-}" != "" ] || die "usage: android-settings <apply|verify|list-props|notify|sync-hooks|qs-list|qs-add|qs-remove|install-hook|remove-hook|list-hooks>"
+[ "${1:-}" != "" ] || die "usage: android-settings <apply|verify|lint|list-props|get|set|notify|sync-hooks|qs-list|qs-add|qs-remove|install-hook|remove-hook|restart-hook|reinstall-hooks|test-hook|log|logs|status|list-hooks|disable-app|enable-app|list-disabled>"
 cmd=$1
 shift
-
-# Resolve one manifest argument into a path (see the usage note above).
-resolve_manifest() {
-  case "$1" in
-    all)
-      for f in "$PROPS_DIR"/*.props; do
-        [ -f "$f" ] || continue
-        printf '%s\n' "$f"
-      done
-      ;;
-    */* | *.props) printf '%s\n' "$1" ;;
-    *) printf '%s\n' "$PROPS_DIR/$1.props" ;;
-  esac
-}
 
 case "$cmd" in
   apply | verify)
     DRY_RUN=0
+    ONLY_CHANGED=0
+    JSON=0
     manifests=""
     # Resolved paths are space-joined below (nix store paths never contain
     # spaces), which is what plain sh gives us for `set --`.
     for a in "$@"; do
       case "$a" in
         --dry-run) DRY_RUN=1 ;;
+        --json)
+          [ "$cmd" = verify ] || die "--json is only meaningful for verify"
+          JSON=1
+          ;;
+        --only-changed)
+          [ "$cmd" = apply ] || die "--only-changed is only meaningful for apply"
+          ONLY_CHANGED=1
+          ;;
+        -*) die "unknown option: $a" ;;
         *) manifests="$manifests $(resolve_manifest "$a")" ;;
       esac
     done
@@ -760,6 +1117,27 @@ case "$cmd" in
     else
       do_verify "$@"
     fi
+    ;;
+  lint)
+    manifests=""
+    for a in "$@"; do
+      case "$a" in
+        -*) die "unknown option: $a" ;;
+        *) manifests="$manifests $(resolve_manifest "$a")" ;;
+      esac
+    done
+    [ -n "$manifests" ] || manifests="$(resolve_manifest default)"
+    # shellcheck disable=SC2086
+    set -- $manifests
+    do_lint "$@"
+    ;;
+  get)
+    [ $# -eq 2 ] || die "get NS KEY   (NS = global|system|secure)"
+    settings_get "$1" "$2"
+    ;;
+  set)
+    [ $# -ge 3 ] || die "set NS KEY VALUE   (NS = global|system|secure)"
+    settings_set "$1" "$2" "$3"
     ;;
   install-hook)
     [ $# -ge 1 ] || die "install-hook NAME [--env-file FILE]"
@@ -781,6 +1159,43 @@ case "$cmd" in
   remove-hook)
     [ $# -eq 1 ] || die "remove-hook NAME"
     remove_hook "$1"
+    ;;
+  restart-hook)
+    [ $# -eq 1 ] || die "restart-hook NAME"
+    restart_hook "$1"
+    ;;
+  reinstall-hooks)
+    reinstall_hooks "$@"
+    ;;
+  test-hook)
+    [ $# -ge 1 ] || die "test-hook NAME [SECONDS]"
+    test_hook "$1" "${2:-5}"
+    ;;
+  log)
+    [ $# -ge 1 ] || die "log NAME [-f]"
+    follow=0
+    lines=50
+    name=$1
+    shift
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -f | --follow) follow=1 ;;
+        -n)
+          [ $# -ge 2 ] || die "-n needs a line count"
+          lines=$2
+          shift
+          ;;
+        *) die "unknown option: $1" ;;
+      esac
+      shift
+    done
+    show_log "$name" "$follow" "$lines"
+    ;;
+  logs)
+    list_logs
+    ;;
+  status)
+    do_status
     ;;
   disable-app)
     [ $# -ge 1 ] || die "disable-app PKG..."
